@@ -1475,8 +1475,6 @@ fn build_dedup_set(ref_map: &RefMap) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Recursively collect all `backendNodeId` values from a CDP DOM node tree
-/// (as returned by `DOM.describeNode` with `depth: -1`).
 /// `DOM.describeNode` parameters for the whole DOM subtree (depth -1) of
 /// `object_id`, so every backendNodeId under the matched element can be
 /// collected, through shadow roots too: a web component's controls live in
@@ -1486,6 +1484,8 @@ fn describe_subtree_params(object_id: &str) -> Value {
     serde_json::json!({ "objectId": object_id, "depth": -1, "pierce": true })
 }
 
+/// Recursively collect all `backendNodeId` values from a CDP DOM node tree
+/// (as returned by `DOM.describeNode` with `depth: -1`).
 fn collect_backend_node_ids(node: &Value, ids: &mut std::collections::HashSet<i64>) {
     if let Some(id) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
         ids.insert(id);
