@@ -374,12 +374,10 @@ pub async fn take_snapshot(
                 .object_id
                 .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
 
-            // Request the full DOM subtree (depth: -1) so we can collect all
-            // backendNodeIds that live under the matched element.
             let describe: Value = client
                 .send_command(
                     "DOM.describeNode",
-                    Some(serde_json::json!({ "objectId": object_id, "depth": -1 })),
+                    Some(describe_subtree_params(&object_id)),
                     Some(session_id),
                 )
                 .await?;
@@ -1479,6 +1477,15 @@ fn build_dedup_set(ref_map: &RefMap) -> std::collections::HashSet<String> {
 
 /// Recursively collect all `backendNodeId` values from a CDP DOM node tree
 /// (as returned by `DOM.describeNode` with `depth: -1`).
+/// `DOM.describeNode` parameters for the whole DOM subtree (depth -1) of
+/// `object_id`, so every backendNodeId under the matched element can be
+/// collected, through shadow roots too: a web component's controls live in
+/// its shadow root, and without `pierce` the subtree stops at the host (on
+/// a live page, a consent banner's host gave no node with its buttons).
+fn describe_subtree_params(object_id: &str) -> Value {
+    serde_json::json!({ "objectId": object_id, "depth": -1, "pierce": true })
+}
+
 fn collect_backend_node_ids(node: &Value, ids: &mut std::collections::HashSet<i64>) {
     if let Some(id) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
         ids.insert(id);
@@ -1501,6 +1508,18 @@ fn collect_backend_node_ids(node: &Value, ids: &mut std::collections::HashSet<i6
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_selector_snapshot_describes_its_subtree_through_shadow_roots() {
+        let params = super::describe_subtree_params("obj-1");
+        assert_eq!(params["objectId"], "obj-1");
+        assert_eq!(params["depth"], -1);
+        assert_eq!(
+            params["pierce"], true,
+            "a host's shadow content is part of its subtree"
+        );
+    }
+
     use super::*;
 
     #[test]
