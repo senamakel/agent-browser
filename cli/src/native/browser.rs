@@ -348,6 +348,10 @@ pub enum WaitUntil {
     Load,
     DomContentLoaded,
     NetworkIdle,
+    /// Like `NetworkIdle`, but quiet is counted from the start of the wait,
+    /// so a page that is already idle resolves after 500 ms of silence
+    /// rather than after a first 600 ms receive timeout and then 500 ms more.
+    NetworkQuiet,
     None,
 }
 
@@ -356,6 +360,7 @@ impl WaitUntil {
         match s {
             "domcontentloaded" => Self::DomContentLoaded,
             "networkidle" => Self::NetworkIdle,
+            "networkquiet" => Self::NetworkQuiet,
             "none" => Self::None,
             _ => Self::Load,
         }
@@ -1172,6 +1177,10 @@ impl BrowserManager {
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
             WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
+            WaitUntil::NetworkQuiet => {
+                let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+                return poll_network(session_id, rx, timeout, Quiet::FromStart).await;
+            }
             WaitUntil::None => return Ok(()),
         };
 
@@ -1276,7 +1285,7 @@ impl BrowserManager {
             WaitUntil::DomContentLoaded => Some("document.readyState !== 'loading'"),
             // Network idle is tracked from live network events; its poller
             // already treats a quiet stream as idle.
-            WaitUntil::NetworkIdle | WaitUntil::None => None,
+            WaitUntil::NetworkIdle | WaitUntil::NetworkQuiet | WaitUntil::None => None,
         };
         if let Some(expression) = already_reached {
             let probe: Result<EvaluateResult, String> = self
@@ -2231,14 +2240,41 @@ async fn poll_network_idle(
     rx: &mut broadcast::Receiver<CdpEvent>,
     overall_timeout: tokio::time::Duration,
 ) -> Result<(), String> {
+    poll_network(session_id, rx, overall_timeout, Quiet::AfterSilence).await
+}
+
+/// When a network wait starts counting quiet time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Quiet {
+    /// After a first receive window passes with nothing in flight: an idle
+    /// page resolves after about 1.1 s (`networkidle`).
+    AfterSilence,
+    /// From the start of the wait, polling every 100 ms: an idle page
+    /// resolves after 500 ms of silence (`networkquiet`).
+    FromStart,
+}
+
+/// The network-idle loop: `Ok(())` once nothing has been in flight for
+/// 500 ms, counted as `quiet` says, or `Err` after `overall_timeout`.
+async fn poll_network(
+    session_id: &str,
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    overall_timeout: tokio::time::Duration,
+    quiet: Quiet,
+) -> Result<(), String> {
     let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let window = match quiet {
+        Quiet::AfterSilence => 600,
+        Quiet::FromStart => 100,
+    };
 
     tokio::time::timeout(overall_timeout, async {
-        let mut idle_start: Option<tokio::time::Instant> = None;
+        let mut idle_start: Option<tokio::time::Instant> =
+            (quiet == Quiet::FromStart).then(tokio::time::Instant::now);
 
         loop {
             let recv_result =
-                tokio::time::timeout(tokio::time::Duration::from_millis(600), rx.recv()).await;
+                tokio::time::timeout(tokio::time::Duration::from_millis(window), rx.recv()).await;
 
             match recv_result {
                 Ok(Ok(event)) if event.session_id.as_deref() == Some(session_id) => {
@@ -2923,6 +2959,62 @@ mod tests {
         );
 
         drop(tx);
+    }
+
+    /// `networkquiet` counts quiet from the start: a silent stream resolves
+    /// after the 500 ms window (never instantly, as #846 requires), well
+    /// before `networkidle`'s first 600 ms receive timeout plus 500 ms.
+    #[tokio::test]
+    async fn test_network_quiet_counts_from_the_start() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let start = tokio::time::Instant::now();
+        let result = poll_network("s1", &mut rx, Duration::from_secs(5), Quiet::FromStart).await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(800),
+            "network quiet returned in {:?}, expected 500-800ms",
+            elapsed
+        );
+        drop(tx);
+    }
+
+    /// `networkquiet` still waits out a request in flight, then 500 ms more.
+    #[tokio::test]
+    async fn test_network_quiet_waits_for_requests_in_flight() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let session = "s1";
+        let _keep_alive = tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(cdp_event(
+                "Network.requestWillBeSent",
+                session,
+                json!({ "requestId": "r1" }),
+            ));
+            sleep(Duration::from_millis(600)).await;
+            let _ = tx.send(cdp_event(
+                "Network.loadingFinished",
+                session,
+                json!({ "requestId": "r1" }),
+            ));
+        });
+        let start = tokio::time::Instant::now();
+        let result = poll_network(session, &mut rx, Duration::from_secs(5), Quiet::FromStart).await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1150),
+            "network quiet returned in {:?}, before the request finished and 500ms passed",
+            elapsed
+        );
+    }
+
+    /// `WaitUntil` reads `networkquiet` as its own state.
+    #[test]
+    fn test_wait_until_reads_network_quiet() {
+        assert!(WaitUntil::from_str("networkquiet") == WaitUntil::NetworkQuiet);
+        assert!(WaitUntil::from_str("networkidle") == WaitUntil::NetworkIdle);
     }
 
     /// Normal flow: requests start and finish, idle is detected after the last
