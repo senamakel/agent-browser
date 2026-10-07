@@ -272,14 +272,19 @@ agent-browser wait --fn "window.ready === true"  # Wait for JS condition
 # Use networkidle only when the page is known to become quiet
 agent-browser wait --load networkidle
 
+# Wait until the requests that change the page are done, ignoring pings, images, and other frames
+agent-browser wait --load networkquiet
+
 # Wait for text/element to disappear
 agent-browser wait --fn "!document.body.innerText.includes('Loading...')"
 agent-browser wait "#spinner" --state hidden
 ```
 
-**Load states:** `load`, `domcontentloaded`, `networkidle`
+**Load states:** `load`, `domcontentloaded`, `networkidle`, `networkquiet`
 
 After a page change, prefer a selector, text, URL, or JavaScript condition that represents the state you need. Use `load` or `domcontentloaded` when the lifecycle event is the milestone. `networkidle` is supported for pages known to become quiet, but SSE, WebSockets, polling, and long-polling can keep it from resolving.
+
+`networkquiet` resolves once the requests that can change what the page shows have been done for 500 ms: the page's own document, scripts, stylesheets, and XHR or fetch data. Analytics pings, images, fonts, media, prefetches, and other frames' documents are not counted, so a page that keeps sending them still goes quiet. Quiet is counted from the start of the wait, and requests an action sent in the 3 seconds before the wait are waited for too. A fetch that never ends, such as a long poll, can still keep it from resolving.
 
 ### Batch Execution
 
