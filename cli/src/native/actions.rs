@@ -15,7 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
 use super::auth;
-use super::browser::{should_track_target, BrowserManager, WaitUntil};
+use super::browser::{should_track_target, wall_now, BrowserManager, InFlight, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -597,6 +597,9 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
+    /// The active page's page-changing requests not yet finished, for a
+    /// `networkquiet` wait that starts after the action that sent them.
+    pub(crate) in_flight: InFlight,
     pub active_frame_id: Option<String>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
@@ -848,6 +851,7 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
+            in_flight: InFlight::default(),
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
@@ -1874,6 +1878,20 @@ impl DaemonState {
                     } else {
                         false
                     };
+
+                    if let (true, Some(browser), Some(session_id)) = (
+                        session_matches,
+                        self.browser.as_ref(),
+                        event.session_id.as_deref(),
+                    ) {
+                        self.in_flight.note(
+                            session_id,
+                            &event.method,
+                            &event.params,
+                            browser.page_target_id(session_id),
+                            wall_now(),
+                        );
+                    }
 
                     // Allow Network events from cross-origin iframe sessions
                     // when HAR recording or request tracking is active.
@@ -6751,8 +6769,7 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     if let Some(load_state) = cmd.get("loadState").and_then(|v| v.as_str()) {
         let wait_until = WaitUntil::from_str(load_state);
-        mgr.wait_for_lifecycle_external(wait_until, &session_id)
-            .await?;
+        wait_for_load_state(state, wait_until, &session_id).await?;
         return Ok(json!({ "waited": "load", "state": load_state }));
     }
 
@@ -9831,7 +9848,7 @@ async fn handle_waitforurl(cmd: &Value, state: &DaemonState) -> Result<Value, St
     Ok(json!({ "url": url }))
 }
 
-async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_waitforloadstate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let load_state = cmd.get("state").and_then(|v| v.as_str()).unwrap_or("load");
@@ -9840,12 +9857,40 @@ async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Val
     let wait_until = WaitUntil::from_str(load_state);
     let _ = tokio::time::timeout(
         tokio::time::Duration::from_millis(timeout_ms),
-        mgr.wait_for_lifecycle_external(wait_until, &session_id),
+        wait_for_load_state(state, wait_until, &session_id),
     )
     .await
     .map_err(|_| format!("Timeout waiting for load state: {}", load_state))?;
 
     Ok(json!({ "state": load_state }))
+}
+
+/// Waits for `wait_until` on `session_id`. The action a `networkquiet` wait
+/// follows sent its requests before the wait could subscribe, so it
+/// subscribes, then drains what came before: every request is then either
+/// kept in flight ([`InFlight`]) or seen by the wait.
+async fn wait_for_load_state(
+    state: &mut DaemonState,
+    wait_until: WaitUntil,
+    session_id: &str,
+) -> Result<(), String> {
+    if wait_until != WaitUntil::NetworkQuiet {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        return mgr
+            .wait_for_lifecycle_external(wait_until, session_id)
+            .await;
+    }
+    let mut rx = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .client
+        .subscribe();
+    state.drain_cdp_events_background().await?;
+    let in_flight = state.in_flight.recent(session_id, wall_now());
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    mgr.wait_for_network_quiet(session_id, &mut rx, in_flight)
+        .await
 }
 
 async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
