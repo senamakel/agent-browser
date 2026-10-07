@@ -1179,7 +1179,21 @@ impl BrowserManager {
             WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
             WaitUntil::NetworkQuiet => {
                 let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
-                return poll_network(session_id, rx, timeout, Quiet::FromStart).await;
+                // A page target's main frame shares its target's id.
+                let main_frame = self
+                    .pages
+                    .iter()
+                    .find(|page| page.session_id == session_id)
+                    .map(|page| page.target_id.clone());
+                return poll_network(
+                    session_id,
+                    rx,
+                    timeout,
+                    Quiet::FromStart {
+                        main_frame: main_frame.as_deref(),
+                    },
+                )
+                .await;
             }
             WaitUntil::None => return Ok(()),
         };
@@ -2243,15 +2257,35 @@ async fn poll_network_idle(
     poll_network(session_id, rx, overall_timeout, Quiet::AfterSilence).await
 }
 
-/// When a network wait starts counting quiet time.
+/// When a network wait starts counting quiet time, and what it counts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Quiet {
+enum Quiet<'a> {
     /// After a first receive window passes with nothing in flight: an idle
     /// page resolves after about 1.1 s (`networkidle`).
     AfterSilence,
-    /// From the start of the wait, polling every 100 ms: an idle page
-    /// resolves after 500 ms of silence (`networkquiet`).
-    FromStart,
+    /// From the start of the wait, polling every 100 ms, and counting only
+    /// the requests that can change what the page shows ([`changes_page`]),
+    /// `main_frame`'s documents among them: an idle page resolves after
+    /// 500 ms of silence (`networkquiet`).
+    FromStart { main_frame: Option<&'a str> },
+}
+
+/// Whether a request can change what the page shows: the page's own
+/// document, a script, a stylesheet, or data it fetches. An analytics ping,
+/// a picture, a font, media, a prefetch, a stream, and a document of
+/// another frame cannot; some of them (a ping, the document of a frame in
+/// another process) never even report finishing to the page's session, so
+/// a page that sent one would never go quiet. A request of no known type
+/// counts.
+fn changes_page(params: &Value, main_frame: Option<&str>) -> bool {
+    match params.get("type").and_then(Value::as_str) {
+        Some("XHR" | "Fetch" | "Script" | "Stylesheet") | None => true,
+        Some("Document") => match (main_frame, params.get("frameId").and_then(Value::as_str)) {
+            (Some(main), Some(frame)) => main == frame,
+            _ => true,
+        },
+        Some(_) => false,
+    }
 }
 
 /// The network-idle loop: `Ok(())` once nothing has been in flight for
@@ -2260,17 +2294,17 @@ async fn poll_network(
     session_id: &str,
     rx: &mut broadcast::Receiver<CdpEvent>,
     overall_timeout: tokio::time::Duration,
-    quiet: Quiet,
+    quiet: Quiet<'_>,
 ) -> Result<(), String> {
     let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let window = match quiet {
-        Quiet::AfterSilence => 600,
-        Quiet::FromStart => 100,
+    let (window, counted): (u64, Option<Option<&str>>) = match quiet {
+        Quiet::AfterSilence => (600, None),
+        Quiet::FromStart { main_frame } => (100, Some(main_frame)),
     };
 
     tokio::time::timeout(overall_timeout, async {
         let mut idle_start: Option<tokio::time::Instant> =
-            (quiet == Quiet::FromStart).then(tokio::time::Instant::now);
+            counted.is_some().then(tokio::time::Instant::now);
 
         loop {
             let recv_result =
@@ -2281,17 +2315,24 @@ async fn poll_network(
                     let mut p = pending.lock().await;
                     match event.method.as_str() {
                         "Network.requestWillBeSent" => {
+                            let counts = counted
+                                .is_none_or(|main_frame| changes_page(&event.params, main_frame));
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.insert(id.to_string());
-                                idle_start = None;
+                                if counts {
+                                    p.insert(id.to_string());
+                                    idle_start = None;
+                                }
                             }
                         }
                         "Network.loadingFinished" | "Network.loadingFailed" => {
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.remove(id);
-                                if p.is_empty() {
+                                let was_pending = p.remove(id);
+                                // Counting only what changes the page, a request
+                                // not counted, or sent before the wait, ending
+                                // says nothing about the page going quiet.
+                                if p.is_empty() && (was_pending || counted.is_none()) {
                                     idle_start = Some(tokio::time::Instant::now());
                                 }
                             }
@@ -2968,7 +3009,13 @@ mod tests {
     async fn test_network_quiet_counts_from_the_start() {
         let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
         let start = tokio::time::Instant::now();
-        let result = poll_network("s1", &mut rx, Duration::from_secs(5), Quiet::FromStart).await;
+        let result = poll_network(
+            "s1",
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart { main_frame: None },
+        )
+        .await;
         assert!(result.is_ok());
         let elapsed = start.elapsed();
         assert!(
@@ -3000,7 +3047,13 @@ mod tests {
             ));
         });
         let start = tokio::time::Instant::now();
-        let result = poll_network(session, &mut rx, Duration::from_secs(5), Quiet::FromStart).await;
+        let result = poll_network(
+            session,
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart { main_frame: None },
+        )
+        .await;
         assert!(result.is_ok());
         let elapsed = start.elapsed();
         assert!(
@@ -3008,6 +3061,79 @@ mod tests {
             "network quiet returned in {:?}, before the request finished and 500ms passed",
             elapsed
         );
+    }
+
+    /// `networkquiet` counts only what can change the page: a ping, a
+    /// picture, and another frame's document that never report finishing
+    /// leave it quiet, and so does the end of a request it never saw start.
+    #[tokio::test]
+    async fn test_network_quiet_counts_only_what_changes_the_page() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let session = "s1";
+        let _keep_alive = tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            for params in [
+                json!({ "requestId": "ping", "type": "Ping" }),
+                json!({ "requestId": "image", "type": "Image" }),
+                json!({ "requestId": "frame", "type": "Document", "frameId": "ads" }),
+            ] {
+                let _ = tx.send(cdp_event("Network.requestWillBeSent", session, params));
+            }
+            for later in 0..4 {
+                sleep(Duration::from_millis(150)).await;
+                let _ = tx.send(cdp_event(
+                    "Network.loadingFinished",
+                    session,
+                    json!({ "requestId": format!("before-{later}") }),
+                ));
+            }
+        });
+        let start = tokio::time::Instant::now();
+        let result = poll_network(
+            session,
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart {
+                main_frame: Some("main"),
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(800),
+            "network quiet returned in {:?}, expected 500-800ms",
+            elapsed
+        );
+    }
+
+    /// The page's own document, a script, a stylesheet, and fetched data
+    /// change the page; everything else does not.
+    #[test]
+    fn test_changes_page_reads_the_request_type_and_frame() {
+        let request = |kind: &str, frame: &str| json!({ "type": kind, "frameId": frame });
+        for kind in ["XHR", "Fetch", "Script", "Stylesheet"] {
+            assert!(changes_page(&request(kind, "ads"), Some("main")), "{kind}");
+        }
+        assert!(changes_page(&request("Document", "main"), Some("main")));
+        assert!(!changes_page(&request("Document", "ads"), Some("main")));
+        assert!(changes_page(&request("Document", "ads"), None));
+        for kind in [
+            "Ping",
+            "Image",
+            "Font",
+            "Media",
+            "Other",
+            "Prefetch",
+            "EventSource",
+        ] {
+            assert!(
+                !changes_page(&request(kind, "main"), Some("main")),
+                "{kind}"
+            );
+        }
+        assert!(changes_page(&json!({}), Some("main")), "no type: counted");
     }
 
     /// `WaitUntil` reads `networkquiet` as its own state.
