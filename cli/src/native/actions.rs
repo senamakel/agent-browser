@@ -26,6 +26,7 @@ use super::cdp::types::{
 use super::cookies;
 use super::diff;
 use super::element::RefMap;
+use super::identity::{Emulation, Identity, Screen, UserAgentMetadata};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -313,6 +314,7 @@ fn launch_hash(
     opts.proxy_username.hash(&mut h);
     opts.proxy_password.hash(&mut h);
     opts.user_agent.hash(&mut h);
+    opts.identity.fingerprint().hash(&mut h);
     opts.ca_cert_digest.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
@@ -475,6 +477,12 @@ pub struct SessionSetup {
     pub emulated_media: Option<EmulatedMedia>,
     pub timezone: Option<String>,
     pub locale: Option<String>,
+    /// Client-hint metadata sent with the user agent override.
+    pub user_agent_metadata: Option<UserAgentMetadata>,
+    /// `Accept-Language` sent with the user agent override.
+    pub accept_language: Option<String>,
+    /// Screen size and pixel ratio from the `launch` command.
+    pub screen: Option<Screen>,
     /// `(latitude, longitude, accuracy)`.
     pub geolocation: Option<(f64, f64, Option<f64>)>,
     /// Global headers from the `headers` and `credentials` commands
@@ -495,6 +503,11 @@ impl SessionSetup {
     fn from_launch_options(options: &LaunchOptions) -> Self {
         Self {
             user_agent: options.user_agent.clone(),
+            timezone: options.identity.timezone.clone(),
+            locale: options.identity.locale.clone(),
+            user_agent_metadata: options.identity.user_agent_metadata.clone(),
+            accept_language: options.identity.accept_language.clone(),
+            screen: options.identity.screen.clone(),
             emulated_media: options.color_scheme.as_ref().map(|scheme| EmulatedMedia {
                 media: None,
                 features: vec![("prefers-color-scheme".to_string(), scheme.clone())],
@@ -506,6 +519,9 @@ impl SessionSetup {
     /// True when nothing has been configured, so there is nothing to replay.
     fn is_empty(&self) -> bool {
         self.user_agent.is_none()
+            && self.user_agent_metadata.is_none()
+            && self.accept_language.is_none()
+            && self.screen.is_none()
             && self.emulated_media.is_none()
             && self.timezone.is_none()
             && self.locale.is_none()
@@ -4010,8 +4026,10 @@ async fn session_setup_pending(state: &DaemonState) -> bool {
 ///
 /// Call after `Page`/`Network` are enabled on `session_id` and before its
 /// first navigation, so init scripts, UA, and headers cover the initial
-/// document. Emulation failures are ignored: a call the engine rejects
-/// should not abort creating the tab.
+/// document. Identity (user agent, client hints, language, timezone, locale,
+/// screen) is not best-effort: a target that missed it would leak the
+/// browser's own, so a rejected call fails creating the tab. Geolocation and
+/// media emulation failures are ignored.
 async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Result<(), String> {
     let client = state
         .browser
@@ -4021,15 +4039,16 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         .clone();
     let setup = state.session_setup.clone();
 
-    if let Some(ref ua) = setup.user_agent {
-        let _ = client
-            .send_command(
-                "Emulation.setUserAgentOverride",
-                Some(json!({ "userAgent": ua })),
-                Some(session_id),
-            )
-            .await;
+    Emulation {
+        user_agent: setup.user_agent.as_deref(),
+        user_agent_metadata: setup.user_agent_metadata.as_ref(),
+        accept_language: setup.accept_language.as_deref(),
+        timezone: setup.timezone.as_deref(),
+        locale: setup.locale.as_deref(),
+        screen: setup.screen.as_ref(),
     }
+    .apply(&client, session_id)
+    .await?;
 
     if let Some(ref emulated) = setup.emulated_media {
         let mut params = json!({});
@@ -4047,26 +4066,6 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         }
         let _ = client
             .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
-            .await;
-    }
-
-    if let Some(ref tz) = setup.timezone {
-        let _ = client
-            .send_command(
-                "Emulation.setTimezoneOverride",
-                Some(json!({ "timezoneId": tz })),
-                Some(session_id),
-            )
-            .await;
-    }
-
-    if let Some(ref locale) = setup.locale {
-        let _ = client
-            .send_command(
-                "Emulation.setLocaleOverride",
-                Some(json!({ "locale": locale })),
-                Some(session_id),
-            )
             .await;
     }
 
@@ -4617,6 +4616,7 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
+        identity: Identity::default(),
     }
 }
 
@@ -5054,6 +5054,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         storage_state,
     })?;
 
+    let identity = Identity::from_launch_command(cmd)?;
     let mut launch_options = LaunchOptions {
         headless,
         executable_path: cmd
@@ -5128,6 +5129,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             }),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
+        identity,
     };
     apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
 
@@ -5142,6 +5144,11 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
         validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
+    }
+    // Inline sources from the launch command run like plugin scripts: on the
+    // launch target and every target the daemon creates after it.
+    if let Some(sources) = string_array_from_command(cmd, "initScriptSources") {
+        state.plugin_init_scripts.extend(sources);
     }
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -7793,8 +7800,18 @@ async fn handle_user_agent(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .get("userAgent")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'userAgent' parameter")?;
-    mgr.set_user_agent(ua).await?;
+    // Optional client-hint metadata and Accept-Language. Left out, they are
+    // cleared, as a user agent set without them never carried them.
+    let identity = Identity::from_launch_command(cmd)?;
+    mgr.set_user_agent(
+        ua,
+        identity.user_agent_metadata.as_ref(),
+        identity.accept_language.as_deref(),
+    )
+    .await?;
     state.session_setup.user_agent = Some(ua.to_string());
+    state.session_setup.user_agent_metadata = identity.user_agent_metadata;
+    state.session_setup.accept_language = identity.accept_language;
     Ok(json!({ "userAgent": ua }))
 }
 
@@ -9240,10 +9257,12 @@ async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     };
 
     mgr.set_viewport(width, height, scale, mobile).await?;
-    mgr.set_user_agent(ua).await?;
+    mgr.set_user_agent(ua, None, None).await?;
 
     state.viewport = Some((width, height, scale, mobile));
     state.session_setup.user_agent = Some(ua.to_string());
+    state.session_setup.user_agent_metadata = None;
+    state.session_setup.accept_language = None;
 
     // Update stream server viewport so status messages and screencast use the new dimensions
     if let Some(ref server) = state.stream_server {
@@ -17277,6 +17296,72 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 None
             )
         );
+    }
+
+    #[test]
+    fn test_launch_hash_changes_with_identity_options() {
+        let base = LaunchOptions::default();
+        let hash = |opts: &LaunchOptions| {
+            launch_hash(opts, &[], &[], &[], &[], Some("chrome"), "local", None)
+        };
+        for identity in [
+            Identity {
+                timezone: Some("Asia/Tokyo".into()),
+                ..Identity::default()
+            },
+            Identity {
+                locale: Some("ja-JP".into()),
+                ..Identity::default()
+            },
+            Identity {
+                accept_language: Some("ja-JP".into()),
+                ..Identity::default()
+            },
+            Identity {
+                screen: Some(Screen {
+                    width: 1920,
+                    height: 1080,
+                    device_scale_factor: 2.0,
+                }),
+                ..Identity::default()
+            },
+        ] {
+            let changed = LaunchOptions {
+                identity,
+                ..base.clone()
+            };
+            assert_ne!(hash(&base), hash(&changed));
+        }
+    }
+
+    #[test]
+    fn test_session_setup_from_launch_options_carries_identity() {
+        let options = LaunchOptions {
+            user_agent: Some("UA/1".into()),
+            identity: Identity {
+                timezone: Some("Asia/Tokyo".into()),
+                locale: Some("ja-JP".into()),
+                accept_language: Some("ja-JP,ja".into()),
+                screen: Some(Screen {
+                    width: 1920,
+                    height: 1080,
+                    device_scale_factor: 2.0,
+                }),
+                ..Identity::default()
+            },
+            ..LaunchOptions::default()
+        };
+        let setup = SessionSetup::from_launch_options(&options);
+        assert_eq!(setup.timezone.as_deref(), Some("Asia/Tokyo"));
+        assert_eq!(setup.locale.as_deref(), Some("ja-JP"));
+        assert_eq!(setup.accept_language.as_deref(), Some("ja-JP,ja"));
+        assert_eq!(setup.screen.as_ref().map(|s| s.width), Some(1920));
+        assert!(!setup.is_empty());
+        let language_only = SessionSetup {
+            accept_language: Some("de".into()),
+            ..SessionSetup::default()
+        };
+        assert!(!language_only.is_empty());
     }
 
     #[test]

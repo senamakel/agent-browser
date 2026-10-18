@@ -1729,6 +1729,27 @@ let reply = execute_command(
 
 `execute_command` takes the same JSON command shape the daemon reads from its socket and returns the same JSON response shape, documented under [Commands](#commands) above. There is no separate library API to learn beyond `StateOptions`, `DaemonState`, and `execute_command`; everything else about a command's request and response is exactly what the CLI already documents.
 
+### Identity launch fields
+
+The `launch` command takes fields that set what a page sees of the browser. They apply to the launch tab and to every tab the daemon opens afterwards, before its first navigation, and a change relaunches the browser. A value the browser rejects (such as an unknown timezone) fails the launch.
+
+<table>
+<thead>
+<tr><th>Field</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>userAgent</code></td><td>User agent string, as before.</td></tr>
+<tr><td><code>userAgentMetadata</code></td><td>Client hints for the user agent: <code>brands</code>, <code>fullVersionList</code>, <code>fullVersion</code>, <code>platform</code> (required), <code>platformVersion</code>, <code>architecture</code>, <code>model</code>, <code>mobile</code>, <code>bitness</code>, <code>wow64</code>. Sets <code>navigator.userAgentData</code> and the <code>sec-ch-ua*</code> request headers. Without it, Chrome sends no <code>sec-ch-ua</code> once the user agent is overridden.</td></tr>
+<tr><td><code>acceptLanguage</code></td><td>Languages for the <code>Accept-Language</code> header, comma-separated without q-values (<code>ja-JP,ja</code>); Chrome adds the q-values. The locale override does not change this header.</td></tr>
+<tr><td><code>timezone</code></td><td>IANA timezone ID, such as <code>Asia/Tokyo</code>.</td></tr>
+<tr><td><code>locale</code></td><td>Locale such as <code>ja-JP</code>, for <code>navigator.language</code> and <code>Intl</code>.</td></tr>
+<tr><td><code>screen</code></td><td><code>{ width, height, deviceScaleFactor }</code>: what <code>screen.width</code>, <code>screen.height</code> and <code>devicePixelRatio</code> report. The viewport keeps its size until a <code>viewport</code> command replaces the override.</td></tr>
+<tr><td><code>initScriptSources</code></td><td>Array of script sources run before the page's own scripts in every document, like <code>--init-script</code> but inline.</td></tr>
+</tbody>
+</table>
+
+The <code>useragent</code> command also accepts <code>userAgentMetadata</code> and <code>acceptLanguage</code>. These apply to browsers the engine launches; they are not sent to a browser it connects to over CDP.
+
 The CLI and MCP surfaces are unchanged by this. The library exposes the daemon's existing command dispatcher; it does not add commands or change existing behavior.
 
 ## Platforms
