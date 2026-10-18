@@ -1750,6 +1750,12 @@ The `launch` command takes fields that set what a page sees of the browser. They
 
 The <code>useragent</code> command also accepts <code>userAgentMetadata</code> and <code>acceptLanguage</code>. These apply to browsers the engine launches; they are not sent to a browser it connects to over CDP.
 
+### Stealth
+
+Set `AGENT_BROWSER_STEALTH=1`, or `"stealth": true` in the `launch` command, and the engine never sends `Runtime.enable` to the browser it launches, on any tab or frame. That call is one of the signals bot checks look for in a browser driven over CDP. Everything else keeps working: `evaluate`, snapshots, clicks, typing and reading run through `Runtime.evaluate` and `Runtime.callFunctionOn`, which need no `Runtime.enable`.
+
+What stealth turns off: the `console` and `errors` commands and console streaming, since Chrome only reports console messages and page exceptions to a client that enabled the Runtime domain. It is off by default and changing it relaunches the browser. It does not apply to a browser the engine connects to over CDP.
+
 The CLI and MCP surfaces are unchanged by this. The library exposes the daemon's existing command dispatcher; it does not add commands or change existing behavior.
 
 ## Platforms

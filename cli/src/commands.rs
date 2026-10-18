@@ -3604,6 +3604,7 @@ mod tests {
             webgpu: false,
             no_webmcp: false,
             no_xvfb: false,
+            stealth: false,
             device: None,
             auto_connect: false,
             pin_tab: false,

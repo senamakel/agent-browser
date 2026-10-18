@@ -494,6 +494,7 @@ impl BrowserManager {
         }
 
         let ignore_https_errors = options.ignore_https_errors;
+        let stealth = options.stealth;
         let user_agent = options.user_agent.clone();
         let identity = options.identity.clone();
         let color_scheme = options.color_scheme.clone();
@@ -524,6 +525,8 @@ impl BrowserManager {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            // Before any target is attached: attaching enables domains.
+            client.set_stealth(stealth);
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
