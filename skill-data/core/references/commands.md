@@ -148,10 +148,11 @@ agent-browser wait --url "**/dashboard"    # Wait for URL pattern (or -u)
 agent-browser wait --load domcontentloaded # Wait for DOMContentLoaded (or -l)
 agent-browser wait --load load             # Wait for the load event
 agent-browser wait --load networkidle      # Wait for network idle on known-quiet pages
+agent-browser wait --load networkquiet     # Wait for the requests that change the page (not pings or images)
 agent-browser wait --fn "window.ready"     # Wait for JS condition (or -f)
 ```
 
-After a page-changing action, prefer the selector, text, URL, or JavaScript condition that represents the result you need. Use a lifecycle wait when the lifecycle event is the milestone. `networkidle` is also supported, but use it only for pages known to become quiet because SSE, WebSockets, polling, and long-polling can keep it from resolving.
+After a page-changing action, prefer the selector, text, URL, or JavaScript condition that represents the result you need. Use a lifecycle wait when the lifecycle event is the milestone. `networkidle` is also supported, but use it only for pages known to become quiet because SSE, WebSockets, polling, and long-polling can keep it from resolving. `networkquiet` counts only the requests that can change what the page shows (the page's document, scripts, stylesheets, XHR and fetch), so analytics pings and images do not hold it up.
 
 ## Mouse Control
 
