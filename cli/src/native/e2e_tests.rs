@@ -12762,3 +12762,143 @@ async fn e2e_launch_with_an_unknown_timezone_fails() {
     );
     assert!(state.browser.is_none());
 }
+
+/// A page that logs to the console on load, plus a button and a field.
+///
+/// A page cannot reliably tell the Runtime domain is on (Chrome 155 no longer
+/// reads an error's `stack` getter for `console.debug`), so these tests watch
+/// the other side of the wire: Chrome sends `Runtime.executionContextCreated`
+/// and `Runtime.consoleAPICalled` only to a client that sent `Runtime.enable`.
+const RUNTIME_PROBE_PAGE: &str = r##"<html><body>
+<button id="go" onclick="document.getElementById('out').textContent = 'clicked'">Go</button>
+<input id="name" aria-label="Name">
+<p id="out">idle</p>
+<script>console.log('runtime probe');</script>
+</body></html>"##;
+
+fn runtime_probe_url() -> String {
+    format!(
+        "data:text/html;base64,{}",
+        STANDARD.encode(RUNTIME_PROBE_PAGE)
+    )
+}
+
+/// Launch, open the probe page and return the Runtime events Chrome sent the
+/// client while the page loaded.
+async fn runtime_events_after_launch(launch: Value) -> (Vec<String>, DaemonState) {
+    let mut state = DaemonState::new();
+    let resp = execute_command(&launch, &mut state).await;
+    assert_success(&resp);
+    let mut raw = state
+        .browser
+        .as_ref()
+        .expect("the browser launched")
+        .client
+        .subscribe_raw();
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": runtime_probe_url() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut events = Vec::new();
+    while let Ok(message) = raw.try_recv() {
+        if let Ok(value) = serde_json::from_str::<Value>(&message.text) {
+            if let Some(method) = value["method"]
+                .as_str()
+                .filter(|m| m.starts_with("Runtime."))
+            {
+                events.push(method.to_string());
+            }
+        }
+    }
+    (events, state)
+}
+
+/// The control: without `stealth` the Runtime domain is on, and Chrome says so.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_without_stealth_enables_the_runtime_domain() {
+    let (events, mut state) = runtime_events_after_launch(
+        json!({ "id": "1", "action": "launch", "headless": true, "stealth": false }),
+    )
+    .await;
+    assert!(
+        events.iter().any(|m| m == "Runtime.consoleAPICalled"),
+        "a normal launch should get console events, got {events:?}"
+    );
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// With `stealth`, Chrome never gets `Runtime.enable` (it sends no Runtime
+/// events), and snapshot, act and read still work, on a new tab too.
+#[tokio::test]
+#[ignore]
+async fn e2e_stealth_launch_never_enables_the_runtime_domain_and_commands_still_work() {
+    let (events, mut state) = runtime_events_after_launch(
+        json!({ "id": "1", "action": "launch", "headless": true, "stealth": true }),
+    )
+    .await;
+    assert_eq!(
+        events,
+        Vec::<String>::new(),
+        "stealth must send no Runtime.enable"
+    );
+
+    let resp = execute_command(&json!({ "id": "4", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    assert!(
+        snapshot.contains("Go"),
+        "snapshot should list the button, got {snapshot}"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "fill", "selector": "#name", "value": "Ada" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "click", "selector": "#go" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "gettext", "selector": "#out" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "clicked");
+    assert_evaluate(
+        &mut state,
+        "8",
+        "document.getElementById('name').value",
+        json!("Ada"),
+    )
+    .await;
+
+    let mut raw = state.browser.as_ref().unwrap().client.subscribe_raw();
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "tab_new", "url": runtime_probe_url() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut tab_events = Vec::new();
+    while let Ok(message) = raw.try_recv() {
+        if message.text.contains("\"method\":\"Runtime.") {
+            tab_events.push(message.text);
+        }
+    }
+    assert!(
+        tab_events.is_empty(),
+        "a new tab must not enable Runtime: {tab_events:?}"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}

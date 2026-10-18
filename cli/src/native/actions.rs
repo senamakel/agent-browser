@@ -322,6 +322,7 @@ fn launch_hash(
     opts.webmcp.hash(&mut h);
     opts.no_xvfb.hash(&mut h);
     opts.restrict_webrtc.hash(&mut h);
+    opts.stealth.hash(&mut h);
     allowed_domains.hash(&mut h);
     enable_features.hash(&mut h);
     init_script_paths.hash(&mut h);
@@ -4544,6 +4545,7 @@ async fn apply_launch_mutator_plugins(
             "allowFileAccess": options.allow_file_access,
             "webgpu": options.webgpu,
             "noXvfb": options.no_xvfb,
+            "stealth": options.stealth,
         }
     });
 
@@ -4616,6 +4618,7 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
+        stealth: stealth_from_env(),
         identity: Identity::default(),
     }
 }
@@ -4654,6 +4657,18 @@ fn no_xvfb_from_env() -> bool {
     env::var("AGENT_BROWSER_NO_XVFB")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
+}
+
+fn stealth_from_env() -> bool {
+    env::var("AGENT_BROWSER_STEALTH")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
+fn stealth_from_launch_cmd(cmd: &Value) -> bool {
+    cmd.get("stealth")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(stealth_from_env)
 }
 
 fn no_xvfb_from_launch_cmd(cmd: &Value) -> bool {
@@ -5129,6 +5144,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             }),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
+        stealth: stealth_from_launch_cmd(cmd),
         identity,
     };
     apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
@@ -16474,6 +16490,33 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         guard.set("AGENT_BROWSER_NO_XVFB", "1");
         assert!(no_xvfb_from_launch_cmd(&json!({})));
         assert!(!no_xvfb_from_launch_cmd(&json!({ "noXvfb": false })));
+    }
+
+    #[test]
+    fn test_stealth_from_launch_cmd() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_STEALTH"]);
+        guard.remove("AGENT_BROWSER_STEALTH");
+        assert!(stealth_from_launch_cmd(&json!({ "stealth": true })));
+        assert!(!stealth_from_launch_cmd(&json!({ "stealth": false })));
+        // Falls back to the daemon env when the command omits the field.
+        assert!(!stealth_from_launch_cmd(&json!({})));
+        guard.set("AGENT_BROWSER_STEALTH", "1");
+        assert!(stealth_from_launch_cmd(&json!({})));
+        assert!(!stealth_from_launch_cmd(&json!({ "stealth": false })));
+        assert!(launch_options_from_env().stealth);
+    }
+
+    #[test]
+    fn test_launch_hash_includes_stealth() {
+        let base = LaunchOptions::default();
+        let stealth = LaunchOptions {
+            stealth: true,
+            ..Default::default()
+        };
+        assert_ne!(
+            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&stealth, &[], &[], &[], &[], Some("chrome"), "local", None)
+        );
     }
 
     #[test]
