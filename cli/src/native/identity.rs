@@ -247,6 +247,29 @@ impl Emulation<'_> {
     }
 }
 
+/// Parameters of `Emulation.setDeviceMetricsOverride` for a viewport set after
+/// launch. The override replaces the one that carried the launch's screen, so
+/// the screen is sent again with it.
+pub fn viewport_params(
+    width: i32,
+    height: i32,
+    device_scale_factor: f64,
+    mobile: bool,
+    screen: Option<&Screen>,
+) -> Value {
+    let mut params = json!({
+        "width": width,
+        "height": height,
+        "deviceScaleFactor": device_scale_factor,
+        "mobile": mobile,
+    });
+    if let Some(screen) = screen {
+        params["screenWidth"] = json!(screen.width);
+        params["screenHeight"] = json!(screen.height);
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +409,25 @@ mod tests {
         assert_eq!(params["screenWidth"], 1920);
         assert_eq!(params["screenHeight"], 1080);
         assert_eq!(params["deviceScaleFactor"], 2.0);
+    }
+
+    #[test]
+    fn a_viewport_set_after_launch_keeps_the_screen() {
+        let screen = Screen {
+            width: 1920,
+            height: 1080,
+            device_scale_factor: 2.0,
+        };
+        let params = viewport_params(1280, 800, 1.0, false, Some(&screen));
+        assert_eq!(params["width"], 1280);
+        assert_eq!(params["height"], 800);
+        assert_eq!(params["deviceScaleFactor"], 1.0);
+        assert_eq!(params["screenWidth"], 1920);
+        assert_eq!(params["screenHeight"], 1080);
+
+        let plain = viewport_params(1280, 800, 1.0, true, None);
+        assert_eq!(plain["mobile"], true);
+        assert!(plain.get("screenWidth").is_none());
     }
 
     #[test]

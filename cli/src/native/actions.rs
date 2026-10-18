@@ -7815,7 +7815,14 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .unwrap_or(1.0);
     let mobile = cmd.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    mgr.set_viewport(width, height, scale, mobile).await?;
+    mgr.set_viewport(
+        width,
+        height,
+        scale,
+        mobile,
+        state.session_setup.screen.as_ref(),
+    )
+    .await?;
 
     state.viewport = Some((width, height, scale, mobile));
 
@@ -9289,7 +9296,7 @@ async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         _ => return Err(format!("Unknown device: {}. Supported: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25", name)),
     };
 
-    mgr.set_viewport(width, height, scale, mobile).await?;
+    mgr.set_viewport(width, height, scale, mobile, None).await?;
     mgr.set_user_agent(ua, None, None).await?;
 
     state.viewport = Some((width, height, scale, mobile));
@@ -11303,7 +11310,14 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .and_then(|v| v.as_i64())
             .unwrap_or(720) as i32;
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.set_viewport(width, height, 1.0, false).await?;
+        mgr.set_viewport(
+            width,
+            height,
+            1.0,
+            false,
+            state.session_setup.screen.as_ref(),
+        )
+        .await?;
 
         // Update stream server viewport
         if let Some(ref server) = state.stream_server {
