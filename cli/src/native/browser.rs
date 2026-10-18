@@ -11,6 +11,7 @@ use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
 use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
+use super::identity::{Emulation, UserAgentMetadata};
 use super::tab_binding;
 
 // ---------------------------------------------------------------------------
@@ -494,6 +495,7 @@ impl BrowserManager {
 
         let ignore_https_errors = options.ignore_https_errors;
         let user_agent = options.user_agent.clone();
+        let identity = options.identity.clone();
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
@@ -569,15 +571,19 @@ impl BrowserManager {
                 .await;
         }
 
-        if let Some(ref ua) = user_agent {
+        let emulation = Emulation {
+            user_agent: user_agent.as_deref(),
+            user_agent_metadata: identity.user_agent_metadata.as_ref(),
+            accept_language: identity.accept_language.as_deref(),
+            timezone: identity.timezone.as_deref(),
+            locale: identity.locale.as_deref(),
+            screen: identity.screen.as_ref(),
+        };
+        if let Err(error) = emulation.apply(&manager.client, &session_id).await {
             let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setUserAgentOverride",
-                    Some(json!({ "userAgent": ua })),
-                    Some(&session_id),
-                )
+                .close_with_timeout(Some(FAILED_INITIALIZATION_CLOSE_TIMEOUT))
                 .await;
+            return Err(error);
         }
 
         if let Some(ref scheme) = color_scheme {
@@ -1851,12 +1857,25 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn set_user_agent(&self, user_agent: &str) -> Result<(), String> {
+    pub async fn set_user_agent(
+        &self,
+        user_agent: &str,
+        metadata: Option<&UserAgentMetadata>,
+        accept_language: Option<&str>,
+    ) -> Result<(), String> {
         let session_id = self.active_session_id()?;
+        let params = Emulation {
+            user_agent: Some(user_agent),
+            user_agent_metadata: metadata,
+            accept_language,
+            ..Emulation::default()
+        }
+        .user_agent_params(None)
+        .unwrap_or_default();
         self.client
             .send_command(
                 "Emulation.setUserAgentOverride",
-                Some(json!({ "userAgent": user_agent })),
+                Some(params),
                 Some(session_id),
             )
             .await?;

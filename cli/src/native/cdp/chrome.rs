@@ -374,6 +374,9 @@ pub struct LaunchOptions {
     /// Restrict WebRTC to proxied transports so direct UDP cannot bypass the
     /// HTTP domain filter. Enabled automatically with `--allowed-domains`.
     pub restrict_webrtc: bool,
+    /// Client-hint metadata, `Accept-Language`, timezone, locale and screen,
+    /// applied to every target before its first navigation.
+    pub identity: crate::native::identity::Identity,
 }
 
 impl LaunchOptions {
@@ -415,6 +418,7 @@ impl Default for LaunchOptions {
             webmcp: true,
             no_xvfb: false,
             restrict_webrtc: false,
+            identity: crate::native::identity::Identity::default(),
         }
     }
 }
