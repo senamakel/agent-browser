@@ -925,7 +925,7 @@ fn tools() -> Vec<Value> {
         wait_tool(TOOL_WAIT_FOR_SELECTOR, "Wait for selector", "Wait for an element to appear.", json!({ "selector": selector_schema() }), &["selector"]),
         wait_tool(TOOL_WAIT_FOR_TEXT, "Wait for text", "Wait for text to appear.", json!({ "text": { "type": "string" } }), &["text"]),
         wait_tool(TOOL_WAIT_FOR_URL, "Wait for URL", "Wait for the current URL to match a pattern.", json!({ "url": { "type": "string", "description": "URL glob or pattern." } }), &["url"]),
-        wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] } }), &["state"]),
+        wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle", "networkquiet"] } }), &["state"]),
         wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression to become truthy.", json!({ "expression": { "type": "string" } }), &["expression"]),
         tool(
             TOOL_SCREENSHOT,
@@ -4848,6 +4848,34 @@ mod tests {
             .unwrap();
         // Must stay in sync with the CLI parser's accepted --content values.
         assert_eq!(modes, &vec![json!("all"), json!("text"), json!("none")]);
+    }
+
+    #[test]
+    fn tool_schema_wait_for_load_states_match_cli() {
+        use crate::native::browser::WaitUntil;
+        let tools = tools();
+        let wait_for_load = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_WAIT_FOR_LOAD))
+            .unwrap();
+        let states = wait_for_load["inputSchema"]["properties"]["state"]["enum"]
+            .as_array()
+            .unwrap();
+        // Every state the CLI's `wait --load` reads, and each read as itself
+        // rather than falling back to `load`.
+        let read: Vec<_> = states
+            .iter()
+            .map(|state| WaitUntil::from_str(state.as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                WaitUntil::Load,
+                WaitUntil::DomContentLoaded,
+                WaitUntil::NetworkIdle,
+                WaitUntil::NetworkQuiet,
+            ]
+        );
     }
 
     #[test]
