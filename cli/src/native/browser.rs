@@ -11,7 +11,7 @@ use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
 use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
-use super::identity::{Emulation, UserAgentMetadata};
+use super::identity::{viewport_params, Emulation, Screen, UserAgentMetadata};
 use super::tab_binding;
 
 // ---------------------------------------------------------------------------
@@ -1804,23 +1804,27 @@ impl BrowserManager {
     // Emulation
     // -----------------------------------------------------------------------
 
+    /// `screen` is the one the browser was launched with, if any: the new
+    /// override would otherwise replace it.
     pub async fn set_viewport(
         &self,
         width: i32,
         height: i32,
         device_scale_factor: f64,
         mobile: bool,
+        screen: Option<&Screen>,
     ) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client
             .send_command(
                 "Emulation.setDeviceMetricsOverride",
-                Some(json!({
-                    "width": width,
-                    "height": height,
-                    "deviceScaleFactor": device_scale_factor,
-                    "mobile": mobile,
-                })),
+                Some(viewport_params(
+                    width,
+                    height,
+                    device_scale_factor,
+                    mobile,
+                    screen,
+                )),
                 Some(session_id),
             )
             .await?;
