@@ -11,6 +11,7 @@ use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
 use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
+use super::identity::{viewport_params, Emulation, Screen, UserAgentMetadata};
 use super::tab_binding;
 
 // ---------------------------------------------------------------------------
@@ -348,6 +349,13 @@ pub enum WaitUntil {
     Load,
     DomContentLoaded,
     NetworkIdle,
+    /// Like `NetworkIdle`, but quiet is counted from the start of the wait,
+    /// so a page that is already idle resolves after 500 ms of silence
+    /// rather than after a first 600 ms receive timeout and then 500 ms more.
+    /// It counts only the requests that can change what the page shows
+    /// (see `changes_page`), and a `wait --load networkquiet` also waits for
+    /// those an action sent moments before the wait began.
+    NetworkQuiet,
     None,
 }
 
@@ -356,6 +364,7 @@ impl WaitUntil {
         match s {
             "domcontentloaded" => Self::DomContentLoaded,
             "networkidle" => Self::NetworkIdle,
+            "networkquiet" => Self::NetworkQuiet,
             "none" => Self::None,
             _ => Self::Load,
         }
@@ -493,7 +502,9 @@ impl BrowserManager {
         }
 
         let ignore_https_errors = options.ignore_https_errors;
+        let stealth = options.stealth;
         let user_agent = options.user_agent.clone();
+        let identity = options.identity.clone();
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
@@ -522,6 +533,8 @@ impl BrowserManager {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            // Before any target is attached: attaching enables domains.
+            client.set_stealth(stealth);
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
@@ -569,15 +582,19 @@ impl BrowserManager {
                 .await;
         }
 
-        if let Some(ref ua) = user_agent {
+        let emulation = Emulation {
+            user_agent: user_agent.as_deref(),
+            user_agent_metadata: identity.user_agent_metadata.as_ref(),
+            accept_language: identity.accept_language.as_deref(),
+            timezone: identity.timezone.as_deref(),
+            locale: identity.locale.as_deref(),
+            screen: identity.screen.as_ref(),
+        };
+        if let Err(error) = emulation.apply(&manager.client, &session_id).await {
             let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setUserAgentOverride",
-                    Some(json!({ "userAgent": ua })),
-                    Some(&session_id),
-                )
+                .close_with_timeout(Some(FAILED_INITIALIZATION_CLOSE_TIMEOUT))
                 .await;
+            return Err(error);
         }
 
         if let Some(ref scheme) = color_scheme {
@@ -1172,6 +1189,11 @@ impl BrowserManager {
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
             WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
+            WaitUntil::NetworkQuiet => {
+                return self
+                    .wait_for_network_quiet(session_id, rx, HashSet::new())
+                    .await;
+            }
             WaitUntil::None => return Ok(()),
         };
 
@@ -1204,6 +1226,29 @@ impl BrowserManager {
     ) -> Result<(), String> {
         let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
         poll_network_idle(session_id, rx, timeout).await
+    }
+
+    /// Waits for `networkquiet` on `session_id`, reading events from `rx`.
+    /// `in_flight` holds the page-changing requests sent before `rx`
+    /// subscribed and not finished since: they are waited for like any
+    /// request `rx` sees start.
+    pub async fn wait_for_network_quiet(
+        &self,
+        session_id: &str,
+        rx: &mut broadcast::Receiver<CdpEvent>,
+        in_flight: HashSet<String>,
+    ) -> Result<(), String> {
+        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        poll_network(
+            session_id,
+            rx,
+            timeout,
+            Quiet::FromStart {
+                main_frame: self.page_target_id(session_id),
+            },
+            in_flight,
+        )
+        .await
     }
 
     pub async fn get_url(&self) -> Result<String, String> {
@@ -1276,7 +1321,7 @@ impl BrowserManager {
             WaitUntil::DomContentLoaded => Some("document.readyState !== 'loading'"),
             // Network idle is tracked from live network events; its poller
             // already treats a quiet stream as idle.
-            WaitUntil::NetworkIdle | WaitUntil::None => None,
+            WaitUntil::NetworkIdle | WaitUntil::NetworkQuiet | WaitUntil::None => None,
         };
         if let Some(expression) = already_reached {
             let probe: Result<EvaluateResult, String> = self
@@ -1396,6 +1441,15 @@ impl BrowserManager {
 
     pub fn has_page_session(&self, session_id: &str) -> bool {
         self.pages.iter().any(|page| page.session_id == session_id)
+    }
+
+    /// The target id of the page whose session is `session_id`, which is
+    /// also the id of its main frame.
+    pub fn page_target_id(&self, session_id: &str) -> Option<&str> {
+        self.pages
+            .iter()
+            .find(|page| page.session_id == session_id)
+            .map(|page| page.target_id.as_str())
     }
 
     pub fn session_id_for_target(&self, target_id: &str) -> Option<&str> {
@@ -1795,23 +1849,27 @@ impl BrowserManager {
     // Emulation
     // -----------------------------------------------------------------------
 
+    /// `screen` is the one the browser was launched with, if any: the new
+    /// override would otherwise replace it.
     pub async fn set_viewport(
         &self,
         width: i32,
         height: i32,
         device_scale_factor: f64,
         mobile: bool,
+        screen: Option<&Screen>,
     ) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client
             .send_command(
                 "Emulation.setDeviceMetricsOverride",
-                Some(json!({
-                    "width": width,
-                    "height": height,
-                    "deviceScaleFactor": device_scale_factor,
-                    "mobile": mobile,
-                })),
+                Some(viewport_params(
+                    width,
+                    height,
+                    device_scale_factor,
+                    mobile,
+                    screen,
+                )),
                 Some(session_id),
             )
             .await?;
@@ -1851,12 +1909,25 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn set_user_agent(&self, user_agent: &str) -> Result<(), String> {
+    pub async fn set_user_agent(
+        &self,
+        user_agent: &str,
+        metadata: Option<&UserAgentMetadata>,
+        accept_language: Option<&str>,
+    ) -> Result<(), String> {
         let session_id = self.active_session_id()?;
+        let params = Emulation {
+            user_agent: Some(user_agent),
+            user_agent_metadata: metadata,
+            accept_language,
+            ..Emulation::default()
+        }
+        .user_agent_params(None)
+        .unwrap_or_default();
         self.client
             .send_command(
                 "Emulation.setUserAgentOverride",
-                Some(json!({ "userAgent": user_agent })),
+                Some(params),
                 Some(session_id),
             )
             .await?;
@@ -2231,31 +2302,174 @@ async fn poll_network_idle(
     rx: &mut broadcast::Receiver<CdpEvent>,
     overall_timeout: tokio::time::Duration,
 ) -> Result<(), String> {
-    let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
+    poll_network(
+        session_id,
+        rx,
+        overall_timeout,
+        Quiet::AfterSilence,
+        HashSet::new(),
+    )
+    .await
+}
+
+/// When a network wait starts counting quiet time, and what it counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Quiet<'a> {
+    /// After a first receive window passes with nothing in flight: an idle
+    /// page resolves after about 1.1 s (`networkidle`).
+    AfterSilence,
+    /// From the start of the wait, polling every 100 ms, and counting only
+    /// the requests that can change what the page shows ([`changes_page`]),
+    /// `main_frame`'s documents among them: an idle page resolves after
+    /// 500 ms of silence (`networkquiet`).
+    FromStart { main_frame: Option<&'a str> },
+}
+
+/// Whether a request can change what the page shows: the page's own
+/// document, a script, a stylesheet, or data it fetches. An analytics ping,
+/// a picture, a font, media, a prefetch, a stream, and a document of
+/// another frame cannot; some of them (a ping, the document of a frame in
+/// another process) never even report finishing to the page's session, so
+/// a page that sent one would never go quiet. A request of no known type
+/// counts.
+fn changes_page(params: &Value, main_frame: Option<&str>) -> bool {
+    match params.get("type").and_then(Value::as_str) {
+        Some("XHR" | "Fetch" | "Script" | "Stylesheet") | None => true,
+        Some("Document") => match (main_frame, params.get("frameId").and_then(Value::as_str)) {
+            (Some(main), Some(frame)) => main == frame,
+            _ => true,
+        },
+        Some(_) => false,
+    }
+}
+
+/// How long ago, in seconds, a request still in flight may have started for
+/// a `networkquiet` wait that begins after it to wait for it: the action
+/// that sent it came moments before the wait. A request older than that,
+/// such as a long poll, is not waited for.
+const IN_FLIGHT_SECS: f64 = 3.0;
+
+/// More requests in flight than this, and those older than
+/// [`IN_FLIGHT_SECS`] are forgotten: some never report finishing.
+const IN_FLIGHT_LIMIT: usize = 256;
+
+/// The page-changing requests ([`changes_page`]) each page session has sent
+/// and not finished, kept from the events the daemon drains, so that a
+/// `networkquiet` wait that starts after an action still waits for what the
+/// action sent before the wait could subscribe.
+#[derive(Debug, Default)]
+pub(crate) struct InFlight {
+    /// Request id to the session that sent it and the wall time, in seconds
+    /// since the epoch, it was sent at.
+    requests: HashMap<String, (String, f64)>,
+}
+
+impl InFlight {
+    /// Notes `method` with `params`, an event of `session`, whose main frame
+    /// is `main_frame`, at wall time `now`.
+    pub(crate) fn note(
+        &mut self,
+        session: &str,
+        method: &str,
+        params: &Value,
+        main_frame: Option<&str>,
+        now: f64,
+    ) {
+        let Some(id) = params.get("requestId").and_then(Value::as_str) else {
+            return;
+        };
+        match method {
+            "Network.requestWillBeSent" if changes_page(params, main_frame) => {
+                let sent = params
+                    .get("wallTime")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(now);
+                self.requests
+                    .insert(id.to_string(), (session.to_string(), sent));
+                if self.requests.len() > IN_FLIGHT_LIMIT {
+                    self.requests
+                        .retain(|_, (_, sent)| now - *sent <= IN_FLIGHT_SECS);
+                }
+            }
+            "Network.loadingFinished" | "Network.loadingFailed" => {
+                self.requests.remove(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// The requests `session` sent at most [`IN_FLIGHT_SECS`] before `now`
+    /// and has not finished.
+    pub(crate) fn recent(&self, session: &str, now: f64) -> HashSet<String> {
+        self.requests
+            .iter()
+            .filter(|(_, (owner, sent))| owner == session && now - sent <= IN_FLIGHT_SECS)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// The wall clock, in seconds since the epoch, as CDP's `wallTime` counts.
+pub(crate) fn wall_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// The network-idle loop: `Ok(())` once nothing has been in flight for
+/// 500 ms, counted as `quiet` says, or `Err` after `overall_timeout`.
+/// `in_flight` are requests already in flight when the wait starts, which
+/// count as pending until they finish.
+async fn poll_network(
+    session_id: &str,
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    overall_timeout: tokio::time::Duration,
+    quiet: Quiet<'_>,
+    in_flight: HashSet<String>,
+) -> Result<(), String> {
+    let state = match quiet {
+        Quiet::AfterSilence => "networkidle",
+        Quiet::FromStart { .. } => "networkquiet",
+    };
+    let quiet_from_start = in_flight.is_empty();
+    let pending = Arc::new(Mutex::new(in_flight));
+    let (window, counted): (u64, Option<Option<&str>>) = match quiet {
+        Quiet::AfterSilence => (600, None),
+        Quiet::FromStart { main_frame } => (100, Some(main_frame)),
+    };
 
     tokio::time::timeout(overall_timeout, async {
-        let mut idle_start: Option<tokio::time::Instant> = None;
+        let mut idle_start: Option<tokio::time::Instant> =
+            (counted.is_some() && quiet_from_start).then(tokio::time::Instant::now);
 
         loop {
             let recv_result =
-                tokio::time::timeout(tokio::time::Duration::from_millis(600), rx.recv()).await;
+                tokio::time::timeout(tokio::time::Duration::from_millis(window), rx.recv()).await;
 
             match recv_result {
                 Ok(Ok(event)) if event.session_id.as_deref() == Some(session_id) => {
                     let mut p = pending.lock().await;
                     match event.method.as_str() {
                         "Network.requestWillBeSent" => {
+                            let counts = counted
+                                .is_none_or(|main_frame| changes_page(&event.params, main_frame));
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.insert(id.to_string());
-                                idle_start = None;
+                                if counts {
+                                    p.insert(id.to_string());
+                                    idle_start = None;
+                                }
                             }
                         }
                         "Network.loadingFinished" | "Network.loadingFailed" => {
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.remove(id);
-                                if p.is_empty() {
+                                let was_pending = p.remove(id);
+                                // Counting only what changes the page, a request
+                                // not counted, or sent too long before the wait
+                                // to be in flight for it, ending says nothing
+                                // about the page going quiet.
+                                if p.is_empty() && (was_pending || counted.is_none()) {
                                     idle_start = Some(tokio::time::Instant::now());
                                 }
                             }
@@ -2292,7 +2506,7 @@ async fn poll_network_idle(
         Ok(())
     })
     .await
-    .map_err(|_| "Timeout waiting for networkidle".to_string())?
+    .map_err(|_| format!("Timeout waiting for {state}"))?
 }
 
 async fn connect_cdp_with_retry(
@@ -2923,6 +3137,288 @@ mod tests {
         );
 
         drop(tx);
+    }
+
+    /// `networkquiet` counts quiet from the start: a silent stream resolves
+    /// after the 500 ms window (never instantly, as #846 requires), well
+    /// before `networkidle`'s first 600 ms receive timeout plus 500 ms.
+    #[tokio::test]
+    async fn test_network_quiet_counts_from_the_start() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let start = tokio::time::Instant::now();
+        let result = poll_network(
+            "s1",
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart { main_frame: None },
+            HashSet::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        // Under networkidle's 1.1 s floor, with room for a slow machine.
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_050),
+            "network quiet returned in {:?}, expected 500-1050ms",
+            elapsed
+        );
+        drop(tx);
+    }
+
+    /// `networkquiet` still waits out a request in flight, then 500 ms more.
+    #[tokio::test]
+    async fn test_network_quiet_waits_for_requests_in_flight() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let session = "s1";
+        let _keep_alive = tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(cdp_event(
+                "Network.requestWillBeSent",
+                session,
+                json!({ "requestId": "r1" }),
+            ));
+            sleep(Duration::from_millis(600)).await;
+            let _ = tx.send(cdp_event(
+                "Network.loadingFinished",
+                session,
+                json!({ "requestId": "r1" }),
+            ));
+        });
+        let start = tokio::time::Instant::now();
+        let result = poll_network(
+            session,
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart { main_frame: None },
+            HashSet::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1150),
+            "network quiet returned in {:?}, before the request finished and 500ms passed",
+            elapsed
+        );
+    }
+
+    /// `networkquiet` counts only what can change the page: a ping, a
+    /// picture, and another frame's document that never report finishing
+    /// leave it quiet, and so does the end of a request it never saw start.
+    #[tokio::test]
+    async fn test_network_quiet_counts_only_what_changes_the_page() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let session = "s1";
+        let _keep_alive = tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            for params in [
+                json!({ "requestId": "ping", "type": "Ping" }),
+                json!({ "requestId": "image", "type": "Image" }),
+                json!({ "requestId": "frame", "type": "Document", "frameId": "ads" }),
+            ] {
+                let _ = tx.send(cdp_event("Network.requestWillBeSent", session, params));
+            }
+            for later in 0..4 {
+                sleep(Duration::from_millis(150)).await;
+                let _ = tx.send(cdp_event(
+                    "Network.loadingFinished",
+                    session,
+                    json!({ "requestId": format!("before-{later}") }),
+                ));
+            }
+        });
+        let start = tokio::time::Instant::now();
+        let result = poll_network(
+            session,
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart {
+                main_frame: Some("main"),
+            },
+            HashSet::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        // Under networkidle's 1.1 s floor, with room for a slow machine.
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_050),
+            "network quiet returned in {:?}, expected 500-1050ms",
+            elapsed
+        );
+    }
+
+    /// A request sent before the wait began, and still in flight, is waited
+    /// for: the wait resolves 500 ms after it finishes, not 500 ms after it
+    /// starts.
+    #[tokio::test]
+    async fn test_network_quiet_waits_for_what_was_in_flight_before_it() {
+        let (tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let session = "s1";
+        let _keep_alive = tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(600)).await;
+            let _ = tx.send(cdp_event(
+                "Network.loadingFinished",
+                session,
+                json!({ "requestId": "click" }),
+            ));
+        });
+        let start = tokio::time::Instant::now();
+        let result = poll_network(
+            session,
+            &mut rx,
+            Duration::from_secs(5),
+            Quiet::FromStart { main_frame: None },
+            HashSet::from(["click".to_string()]),
+        )
+        .await;
+        assert!(result.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1_100),
+            "network quiet returned in {:?}, before the earlier request finished and 500ms passed",
+            elapsed
+        );
+    }
+
+    /// A `networkquiet` wait that runs out says so by its own name.
+    #[tokio::test]
+    async fn test_network_quiet_timeout_names_the_state() {
+        let (_tx, mut rx) = broadcast::channel::<CdpEvent>(16);
+        let result = poll_network(
+            "s1",
+            &mut rx,
+            Duration::from_millis(200),
+            Quiet::FromStart { main_frame: None },
+            HashSet::from(["never".to_string()]),
+        )
+        .await;
+        assert_eq!(result, Err("Timeout waiting for networkquiet".to_string()));
+    }
+
+    /// What is kept in flight: a session's recent page-changing requests,
+    /// until they finish or fail; not a picture, another frame's document,
+    /// another session's request, or one sent too long ago.
+    #[test]
+    fn test_in_flight_keeps_recent_page_changing_requests() {
+        let now = 1_000.0;
+        let sent = |id: &str, kind: &str, frame: &str, ago: f64| json!({ "requestId": id, "type": kind, "frameId": frame, "wallTime": now - ago });
+        let mut in_flight = InFlight::default();
+        for params in [
+            sent("xhr", "XHR", "main", 0.2),
+            sent("page", "Document", "main", 0.1),
+            sent("picture", "Image", "main", 0.1),
+            sent("ad", "Document", "ads", 0.1),
+            sent("poll", "Fetch", "main", 30.0),
+            sent("done", "Script", "main", 0.5),
+            sent("failed", "Fetch", "main", 0.5),
+        ] {
+            in_flight.note(
+                "s1",
+                "Network.requestWillBeSent",
+                &params,
+                Some("main"),
+                now,
+            );
+        }
+        in_flight.note(
+            "s2",
+            "Network.requestWillBeSent",
+            &sent("other", "XHR", "tab", 0.1),
+            Some("tab"),
+            now,
+        );
+        in_flight.note(
+            "s1",
+            "Network.loadingFinished",
+            &json!({ "requestId": "done" }),
+            Some("main"),
+            now,
+        );
+        in_flight.note(
+            "s1",
+            "Network.loadingFailed",
+            &json!({ "requestId": "failed" }),
+            Some("main"),
+            now,
+        );
+        let mut recent: Vec<_> = in_flight.recent("s1", now).into_iter().collect();
+        recent.sort();
+        assert_eq!(recent, vec!["page".to_string(), "xhr".to_string()]);
+        assert_eq!(
+            in_flight.recent("s2", now),
+            HashSet::from(["other".to_string()])
+        );
+        // An event without a request id is not a request.
+        in_flight.note("s1", "Network.requestWillBeSent", &json!({}), None, now);
+        assert_eq!(in_flight.recent("s1", now).len(), 2);
+    }
+
+    /// Requests that never report finishing do not pile up: past
+    /// `IN_FLIGHT_LIMIT`, those sent too long ago are forgotten.
+    #[test]
+    fn test_in_flight_forgets_old_requests_past_its_limit() {
+        let mut in_flight = InFlight::default();
+        for id in 0..IN_FLIGHT_LIMIT {
+            in_flight.note(
+                "s1",
+                "Network.requestWillBeSent",
+                &json!({ "requestId": format!("poll-{id}"), "type": "Fetch", "wallTime": 1.0 }),
+                None,
+                1.0,
+            );
+        }
+        assert_eq!(in_flight.requests.len(), IN_FLIGHT_LIMIT);
+        in_flight.note(
+            "s1",
+            "Network.requestWillBeSent",
+            &json!({ "requestId": "fresh", "type": "XHR" }),
+            None,
+            100.0,
+        );
+        assert_eq!(
+            in_flight.requests.keys().collect::<Vec<_>>(),
+            vec!["fresh"],
+            "a request with no wall time is sent now"
+        );
+    }
+
+    /// The page's own document, a script, a stylesheet, and fetched data
+    /// change the page; everything else does not.
+    #[test]
+    fn test_changes_page_reads_the_request_type_and_frame() {
+        let request = |kind: &str, frame: &str| json!({ "type": kind, "frameId": frame });
+        for kind in ["XHR", "Fetch", "Script", "Stylesheet"] {
+            assert!(changes_page(&request(kind, "ads"), Some("main")), "{kind}");
+        }
+        assert!(changes_page(&request("Document", "main"), Some("main")));
+        assert!(!changes_page(&request("Document", "ads"), Some("main")));
+        assert!(changes_page(&request("Document", "ads"), None));
+        for kind in [
+            "Ping",
+            "Image",
+            "Font",
+            "Media",
+            "Other",
+            "Prefetch",
+            "EventSource",
+        ] {
+            assert!(
+                !changes_page(&request(kind, "main"), Some("main")),
+                "{kind}"
+            );
+        }
+        assert!(changes_page(&json!({}), Some("main")), "no type: counted");
+    }
+
+    /// `WaitUntil` reads `networkquiet` as its own state.
+    #[test]
+    fn test_wait_until_reads_network_quiet() {
+        assert!(WaitUntil::from_str("networkquiet") == WaitUntil::NetworkQuiet);
+        assert!(WaitUntil::from_str("networkidle") == WaitUntil::NetworkIdle);
     }
 
     /// Normal flow: requests start and finish, idle is detected after the last

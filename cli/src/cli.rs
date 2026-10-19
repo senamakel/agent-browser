@@ -2005,6 +2005,7 @@ pub fn main() {
         // fresh environment so both setting and unsetting the var take effect
         // on daemons spawned before the change.
         launch_cmd["noXvfb"] = json!(flags.no_xvfb);
+        launch_cmd["stealth"] = json!(flags.stealth);
 
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);

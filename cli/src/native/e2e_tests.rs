@@ -12475,3 +12475,430 @@ async fn e2e_embedded_state_launches_navigates_and_snapshots() {
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
+
+// ---------------------------------------------------------------------------
+// Identity launch options: client hints, timezone, locale, screen, init scripts
+// ---------------------------------------------------------------------------
+
+fn identity_launch_command() -> Value {
+    json!({
+        "id": "1", "action": "launch", "headless": true,
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        "userAgentMetadata": {
+            "brands": [
+                { "brand": "Not.A/Brand", "version": "99" },
+                { "brand": "Chromium", "version": "141" },
+                { "brand": "Google Chrome", "version": "141" }
+            ],
+            "fullVersionList": [
+                { "brand": "Not.A/Brand", "version": "99.0.0.0" },
+                { "brand": "Chromium", "version": "141.0.7390.55" },
+                { "brand": "Google Chrome", "version": "141.0.7390.55" }
+            ],
+            "platform": "macOS",
+            "platformVersion": "14.6.1",
+            "architecture": "arm",
+            "model": "",
+            "mobile": false,
+            "bitness": "64"
+        },
+        "acceptLanguage": "ja-JP,ja",
+        "timezone": "Asia/Tokyo",
+        "locale": "ja-JP",
+        "screen": { "width": 1920, "height": 1080, "deviceScaleFactor": 2.0 },
+        "initScriptSources": ["window.__identityInit = 'ran-' + navigator.language;"],
+    })
+}
+
+/// Read the identity a page sees, plus the headers its own document request
+/// carried (the echo server returns them as the page's body).
+async fn read_identity(state: &mut DaemonState) -> Value {
+    let resp = execute_command(
+        &json!({
+            "id": "id-read", "action": "evaluate",
+            "script": r#"(async () => {
+                const echoed = JSON.parse(document.body.innerText).headers;
+                const data = navigator.userAgentData;
+                const high = await data.getHighEntropyValues(
+                    ["platformVersion", "architecture", "bitness", "fullVersionList", "model"]);
+                return {
+                    echoed,
+                    brands: data.brands.map(b => b.brand + "/" + b.version),
+                    mobile: data.mobile,
+                    platform: data.platform,
+                    platformVersion: high.platformVersion,
+                    architecture: high.architecture,
+                    fullVersionList: high.fullVersionList.map(b => b.brand + "/" + b.version),
+                    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                    language: navigator.language,
+                    screenWidth: screen.width,
+                    screenHeight: screen.height,
+                    dpr: window.devicePixelRatio,
+                    init: window.__identityInit,
+                };
+            })()"#,
+            "awaitPromise": true,
+        }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    get_data(&resp)["result"].clone()
+}
+
+fn header_of<'a>(headers: &'a Value, name: &str) -> Option<&'a str> {
+    headers.as_object()?.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.as_str())
+            .flatten()
+    })
+}
+
+fn assert_identity(identity: &Value) {
+    assert_eq!(
+        identity["brands"],
+        json!(["Not.A/Brand/99", "Chromium/141", "Google Chrome/141"])
+    );
+    assert_eq!(identity["mobile"], false);
+    assert_eq!(identity["platform"], "macOS");
+    assert_eq!(identity["platformVersion"], "14.6.1");
+    assert_eq!(identity["architecture"], "arm");
+    assert_eq!(
+        identity["fullVersionList"],
+        json!([
+            "Not.A/Brand/99.0.0.0",
+            "Chromium/141.0.7390.55",
+            "Google Chrome/141.0.7390.55"
+        ])
+    );
+    assert_eq!(identity["timeZone"], "Asia/Tokyo");
+    assert_eq!(identity["language"], "ja-JP");
+    assert_eq!(identity["screenWidth"], 1920);
+    assert_eq!(identity["screenHeight"], 1080);
+    assert_eq!(identity["dpr"], 2);
+    assert_eq!(identity["init"], "ran-ja-JP");
+
+    let echoed = &identity["echoed"];
+    let sec_ch_ua = header_of(echoed, "sec-ch-ua")
+        .unwrap_or_else(|| panic!("the request carried no sec-ch-ua: {echoed}"));
+    assert!(
+        sec_ch_ua.contains("\"Google Chrome\";v=\"141\""),
+        "sec-ch-ua should list the given brands, got {sec_ch_ua}"
+    );
+    assert_eq!(header_of(echoed, "sec-ch-ua-platform"), Some("\"macOS\""));
+    assert_eq!(header_of(echoed, "sec-ch-ua-mobile"), Some("?0"));
+    assert_eq!(header_of(echoed, "accept-language"), Some("ja-JP,ja;q=0.9"));
+}
+
+/// A page sees the identity given at launch, and so does its own document
+/// request: `sec-ch-ua` and `Accept-Language` on the wire, the client-hint
+/// object, timezone, language, screen and DPR in script.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_identity_reaches_the_page_and_its_requests() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(&identity_launch_command(), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{}/page", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    assert_identity(&read_identity(&mut state).await);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// A tab the daemon opens itself gets the same identity before its first
+/// navigation.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_identity_reaches_a_new_tab_before_its_first_request() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(&identity_launch_command(), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "tab_new", "url": format!("{}/tab", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    assert_identity(&read_identity(&mut state).await);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Accept-Language alone, with no user agent given, keeps Chrome's own UA.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_accept_language_without_a_user_agent_keeps_the_default_user_agent() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true, "acceptLanguage": "de-DE,de" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{}/page", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "evaluate",
+            "script": "({ headers: JSON.parse(document.body.innerText).headers, ua: navigator.userAgent })",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert_eq!(
+        header_of(&result["headers"], "accept-language"),
+        Some("de-DE,de;q=0.9")
+    );
+    assert!(
+        result["ua"].as_str().unwrap().contains("Chrome/"),
+        "user agent should stay Chrome's own, got {}",
+        result["ua"]
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// The `useragent` command takes the same metadata and language, and a tab
+/// opened afterwards inherits them.
+#[tokio::test]
+#[ignore]
+async fn e2e_useragent_command_with_client_hints_reaches_a_new_tab() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "useragent",
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            "userAgentMetadata": {
+                "brands": [{ "brand": "Chromium", "version": "141" }],
+                "platform": "Linux",
+                "platformVersion": "6.5.0",
+                "architecture": "x86",
+                "mobile": false
+            },
+            "acceptLanguage": "fr-FR,fr",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_new", "url": format!("{}/tab", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "({ headers: JSON.parse(document.body.innerText).headers, platform: navigator.userAgentData.platform })",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert_eq!(result["platform"], "Linux");
+    assert_eq!(
+        header_of(&result["headers"], "sec-ch-ua-platform"),
+        Some("\"Linux\"")
+    );
+    assert_eq!(
+        header_of(&result["headers"], "accept-language"),
+        Some("fr-FR,fr;q=0.9")
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// A timezone the browser rejects fails the launch instead of leaving a
+/// browser that shows its own.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_with_an_unknown_timezone_fails() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true, "timezone": "Not/AZone" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "{resp}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("timezone"),
+        "the error should name the timezone call, got {resp}"
+    );
+    assert!(state.browser.is_none());
+}
+
+/// A page that logs to the console on load, plus a button and a field.
+///
+/// A page cannot reliably tell the Runtime domain is on (Chrome 155 no longer
+/// reads an error's `stack` getter for `console.debug`), so these tests watch
+/// the other side of the wire: Chrome sends `Runtime.executionContextCreated`
+/// and `Runtime.consoleAPICalled` only to a client that sent `Runtime.enable`.
+const RUNTIME_PROBE_PAGE: &str = r##"<html><body>
+<button id="go" onclick="document.getElementById('out').textContent = 'clicked'">Go</button>
+<input id="name" aria-label="Name">
+<p id="out">idle</p>
+<script>console.log('runtime probe');</script>
+</body></html>"##;
+
+fn runtime_probe_url() -> String {
+    format!(
+        "data:text/html;base64,{}",
+        STANDARD.encode(RUNTIME_PROBE_PAGE)
+    )
+}
+
+/// Launch, open the probe page and return the Runtime events Chrome sent the
+/// client while the page loaded.
+async fn runtime_events_after_launch(launch: Value) -> (Vec<String>, DaemonState) {
+    let mut state = DaemonState::new();
+    let resp = execute_command(&launch, &mut state).await;
+    assert_success(&resp);
+    let mut raw = state
+        .browser
+        .as_ref()
+        .expect("the browser launched")
+        .client
+        .subscribe_raw();
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": runtime_probe_url() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut events = Vec::new();
+    while let Ok(message) = raw.try_recv() {
+        if let Ok(value) = serde_json::from_str::<Value>(&message.text) {
+            if let Some(method) = value["method"]
+                .as_str()
+                .filter(|m| m.starts_with("Runtime."))
+            {
+                events.push(method.to_string());
+            }
+        }
+    }
+    (events, state)
+}
+
+/// The control: without `stealth` the Runtime domain is on, and Chrome says so.
+#[tokio::test]
+#[ignore]
+async fn e2e_launch_without_stealth_enables_the_runtime_domain() {
+    let (events, mut state) = runtime_events_after_launch(
+        json!({ "id": "1", "action": "launch", "headless": true, "stealth": false }),
+    )
+    .await;
+    assert!(
+        events.iter().any(|m| m == "Runtime.consoleAPICalled"),
+        "a normal launch should get console events, got {events:?}"
+    );
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// With `stealth`, Chrome never gets `Runtime.enable` (it sends no Runtime
+/// events), and snapshot, act and read still work, on a new tab too.
+#[tokio::test]
+#[ignore]
+async fn e2e_stealth_launch_never_enables_the_runtime_domain_and_commands_still_work() {
+    let (events, mut state) = runtime_events_after_launch(
+        json!({ "id": "1", "action": "launch", "headless": true, "stealth": true }),
+    )
+    .await;
+    assert_eq!(
+        events,
+        Vec::<String>::new(),
+        "stealth must send no Runtime.enable"
+    );
+
+    let resp = execute_command(&json!({ "id": "4", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    assert!(
+        snapshot.contains("Go"),
+        "snapshot should list the button, got {snapshot}"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "fill", "selector": "#name", "value": "Ada" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "click", "selector": "#go" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "gettext", "selector": "#out" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "clicked");
+    assert_evaluate(
+        &mut state,
+        "8",
+        "document.getElementById('name').value",
+        json!("Ada"),
+    )
+    .await;
+
+    let mut raw = state.browser.as_ref().unwrap().client.subscribe_raw();
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "tab_new", "url": runtime_probe_url() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut tab_events = Vec::new();
+    while let Ok(message) = raw.try_recv() {
+        if message.text.contains("\"method\":\"Runtime.") {
+            tab_events.push(message.text);
+        }
+    }
+    assert!(
+        tab_events.is_empty(),
+        "a new tab must not enable Runtime: {tab_events:?}"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
