@@ -168,13 +168,13 @@ jobs:
       - name: Run Rust tests
         run: cargo test --profile ci --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
 
-  windows-tab-new-diagnostic:
-    name: Windows tab_new diagnostic
+  windows-dashboard-cli-diagnostic:
+    name: Windows dashboard CLI diagnostic
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 20
     env:
-      AGENT_BROWSER_TAB_NEW_DIAGNOSTICS: "1"
+      AGENT_BROWSER_DASHBOARD_DIAGNOSTICS: "1"
       CARGO_TERM_COLOR: never
     steps:
       - name: Checkout repository
@@ -190,20 +190,20 @@ jobs:
         with:
           workspaces: cli
 
-      - name: Run focused parity diagnostic
+      - name: Run dashboard lifecycle diagnostic
         shell: pwsh
         timeout-minutes: 17
         run: |
           New-Item -ItemType Directory -Force -Path cli/target | Out-Null
-          cargo test --locked --profile ci --manifest-path cli/Cargo.toml --target x86_64-pc-windows-msvc --lib native::parity_tests::test_all_documented_actions_are_handled -- --exact --nocapture 2>&1 | Tee-Object -FilePath cli/target/tab-new-diagnostic.log
+          cargo test --locked --profile ci --manifest-path cli/Cargo.toml --target x86_64-pc-windows-msvc --test dashboard_cli -- --nocapture 2>&1 | Tee-Object -FilePath cli/target/dashboard-cli-diagnostic.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Preserve diagnostic output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-tab-new-diagnostic
-          path: cli/target/tab-new-diagnostic.log
+          name: windows-dashboard-cli-diagnostic
+          path: cli/target/dashboard-cli-diagnostic.log
           if-no-files-found: ignore
 
   native-e2e:

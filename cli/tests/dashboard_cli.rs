@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -12,6 +14,12 @@ use tempfile::TempDir;
 use std::os::unix::fs::PermissionsExt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
+const DASHBOARD_DIAGNOSTIC_ENV: &str = "AGENT_BROWSER_DASHBOARD_DIAGNOSTICS";
+const LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(8);
+const PIPE_EOF_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+static NEXT_DASHBOARD_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DashboardCleanup<'a>(&'a TempDir);
 
@@ -43,20 +51,86 @@ fn unused_loopback_port() -> u16 {
 }
 
 fn wait_for_dashboard(address: SocketAddr, host: &str, origin: &str) -> String {
+    let diagnostics = dashboard_diagnostics_enabled();
+    let invocation = if diagnostics {
+        NEXT_DASHBOARD_DIAGNOSTIC_ID.fetch_add(1, Ordering::SeqCst)
+    } else {
+        0
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
+        let connect_started = Instant::now();
         match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             Ok(mut stream) => {
-                stream
-                    .write_all(
-                        format!(
-                            "GET /api/sessions HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .unwrap();
+                if diagnostics {
+                    dashboard_diagnostic_marker(
+                        invocation,
+                        "start",
+                        "loopback_connect",
+                        connect_started,
+                        "connected",
+                        "address_omitted",
+                    );
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .expect("set diagnostic dashboard write timeout");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("set diagnostic dashboard read timeout");
+                }
+                let write_started = Instant::now();
+                let request = format!(
+                    "GET /api/sessions HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+                );
+                if let Err(error) = stream.write_all(request.as_bytes()) {
+                    if diagnostics {
+                        dashboard_diagnostic_marker(
+                            invocation,
+                            "start",
+                            "request_write",
+                            write_started,
+                            "error",
+                            "bytes_omitted",
+                        );
+                    }
+                    panic!("dashboard probe request write failed: {error}");
+                }
+                if diagnostics {
+                    dashboard_diagnostic_marker(
+                        invocation,
+                        "start",
+                        "request_write",
+                        write_started,
+                        "ok",
+                        "bytes_omitted",
+                    );
+                }
                 let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
+                let read_started = Instant::now();
+                if let Err(error) = stream.read_to_string(&mut response) {
+                    if diagnostics {
+                        dashboard_diagnostic_marker(
+                            invocation,
+                            "start",
+                            "response_read",
+                            read_started,
+                            "error",
+                            &format!("bytes={}", response.len()),
+                        );
+                        panic!("dashboard probe response read failed");
+                    }
+                    panic!("dashboard probe response read failed: {error}");
+                }
+                if diagnostics {
+                    dashboard_diagnostic_marker(
+                        invocation,
+                        "start",
+                        "response_read",
+                        read_started,
+                        "eof",
+                        &format!("bytes={}", response.len()),
+                    );
+                }
                 return response;
             }
             Err(error) if Instant::now() < deadline => {
@@ -98,21 +172,283 @@ fn run_dashboard(tmp: &TempDir, args: &[&str]) -> Output {
     let socket_dir = socket_dir(tmp);
     std::fs::create_dir_all(&socket_dir).unwrap();
 
-    Command::new(BIN)
+    let mut command = Command::new(BIN);
+    command
         .args(args)
-        .env("AGENT_BROWSER_SOCKET_DIR", socket_dir)
+        .env("AGENT_BROWSER_SOCKET_DIR", &socket_dir)
         .env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
-        .env("NO_COLOR", "1")
+        .env("NO_COLOR", "1");
+
+    if dashboard_diagnostics_enabled() {
+        return run_dashboard_with_diagnostics(command, &socket_dir, args);
+    }
+
+    command
         .output()
         .expect("failed to invoke agent-browser dashboard")
+}
+
+fn dashboard_diagnostics_enabled() -> bool {
+    std::env::var_os(DASHBOARD_DIAGNOSTIC_ENV).is_some()
+}
+
+fn dashboard_test_output(bytes: &[u8]) -> String {
+    if dashboard_diagnostics_enabled() {
+        "<redacted>".to_string()
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
+fn dashboard_operation(args: &[&str]) -> &'static str {
+    if args.first() == Some(&"dashboard") && args.get(1) == Some(&"stop") {
+        "stop"
+    } else if args.first() == Some(&"dashboard") {
+        "start"
+    } else {
+        "other"
+    }
+}
+
+fn dashboard_diagnostic_marker(
+    invocation: u64,
+    operation: &str,
+    stage: &str,
+    started: Instant,
+    outcome: &str,
+    detail: &str,
+) {
+    eprintln!(
+        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage={stage} elapsed_ms={} outcome={outcome} {detail}",
+        started.elapsed().as_millis()
+    );
+}
+
+fn dashboard_probe_port(
+    operation: &str,
+    args: &[&str],
+    socket_dir: &std::path::Path,
+) -> Option<u16> {
+    if operation == "start" {
+        return args
+            .windows(2)
+            .find(|pair| pair[0] == "--port")
+            .and_then(|pair| pair[1].parse::<u16>().ok())
+            .or(Some(4848));
+    }
+    if operation == "stop" {
+        return std::fs::read(socket_dir.join("dashboard.config"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|config| config.get("port")?.as_u64())
+            .and_then(|port| u16::try_from(port).ok());
+    }
+    None
+}
+
+fn dashboard_worker_is_listening(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_pipe_to_channel<R: Read + Send + 'static>(
+    mut pipe: R,
+    sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
+) {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+}
+
+fn collect_diagnostic_pipe(
+    receiver: Receiver<std::io::Result<Vec<u8>>>,
+    invocation: u64,
+    operation: &str,
+    name: &str,
+) -> Vec<u8> {
+    let started = Instant::now();
+    match receiver.recv_timeout(PIPE_EOF_TIMEOUT) {
+        Ok(Ok(bytes)) => {
+            dashboard_diagnostic_marker(
+                invocation,
+                operation,
+                name,
+                started,
+                "eof",
+                &format!("bytes={}", bytes.len()),
+            );
+            bytes
+        }
+        Ok(Err(_)) => {
+            dashboard_diagnostic_marker(
+                invocation,
+                operation,
+                name,
+                started,
+                "read_error",
+                "bytes=0",
+            );
+            Vec::new()
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            dashboard_diagnostic_marker(invocation, operation, name, started, "timeout", "bytes=0");
+            Vec::new()
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            dashboard_diagnostic_marker(
+                invocation,
+                operation,
+                name,
+                started,
+                "disconnected",
+                "bytes=0",
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn run_dashboard_with_diagnostics(
+    mut command: Command,
+    socket_dir: &std::path::Path,
+    args: &[&str],
+) -> Output {
+    let invocation = NEXT_DASHBOARD_DIAGNOSTIC_ID.fetch_add(1, Ordering::SeqCst);
+    let operation = dashboard_operation(args);
+    let port = dashboard_probe_port(operation, args, socket_dir);
+    let spawn_started = Instant::now();
+    eprintln!(
+        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=launcher_spawn_begin elapsed_ms=0 outcome=started"
+    );
+    let spawned = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => {
+            dashboard_diagnostic_marker(
+                invocation,
+                operation,
+                "launcher_spawn",
+                spawn_started,
+                "ok",
+                "",
+            );
+            child
+        }
+        Err(_) => {
+            dashboard_diagnostic_marker(
+                invocation,
+                operation,
+                "launcher_spawn",
+                spawn_started,
+                "error",
+                "",
+            );
+            panic!("dashboard diagnostic launcher spawn failed");
+        }
+    };
+
+    let stdout = child.stdout.take().expect("diagnostic stdout pipe");
+    let stderr = child.stderr.take().expect("diagnostic stderr pipe");
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let (stderr_sender, stderr_receiver) = mpsc::channel();
+    read_pipe_to_channel(stdout, stdout_sender);
+    read_pipe_to_channel(stderr, stderr_sender);
+
+    let launcher_wait_started = Instant::now();
+    let deadline = launcher_wait_started + LAUNCHER_EXIT_TIMEOUT;
+    let (status, launcher_timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let status = child.wait().expect("wait for timed-out dashboard launcher");
+                break (status, true);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .expect("wait for failed dashboard launcher poll");
+                break (status, true);
+            }
+        }
+    };
+    let outcome = if launcher_timed_out {
+        "timeout"
+    } else {
+        "exited"
+    };
+    let exit_status = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    dashboard_diagnostic_marker(
+        invocation,
+        operation,
+        "launcher_exit",
+        launcher_wait_started,
+        outcome,
+        &format!("exit_status={exit_status}"),
+    );
+
+    let stdout = collect_diagnostic_pipe(stdout_receiver, invocation, operation, "stdout_eof");
+    let stderr = collect_diagnostic_pipe(stderr_receiver, invocation, operation, "stderr_eof");
+
+    let sidecars_present =
+        socket_dir.join("dashboard.pid").exists() && socket_dir.join("dashboard.config").exists();
+    eprintln!(
+        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_sidecars elapsed_ms=0 outcome={} details=content_omitted",
+        if sidecars_present { "present" } else { "absent" }
+    );
+    if let Some(port) = port.filter(|_| status.success()) {
+        let worker_probe_started = Instant::now();
+        let listening = dashboard_worker_is_listening(port, WORKER_PROBE_TIMEOUT);
+        dashboard_diagnostic_marker(
+            invocation,
+            operation,
+            "dashboard_worker_listener",
+            worker_probe_started,
+            if listening {
+                "listening"
+            } else {
+                "not_listening"
+            },
+            "address_omitted",
+        );
+    }
+
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn json_output(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
             "stdout was not JSON: {error}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            dashboard_test_output(&output.stdout),
+            dashboard_test_output(&output.stderr)
         )
     })
 }
@@ -139,7 +475,7 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
     assert!(
         started.status.success(),
         "dashboard start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
+        dashboard_test_output(&started.stderr)
     );
     let payload = json_output(&started);
     assert_eq!(payload["data"]["port"], port);
@@ -191,7 +527,8 @@ fn dashboard_listens_on_and_authorizes_ipv6_loopback() {
     );
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
-        "unexpected IPv6 dashboard response: {response}"
+        "unexpected IPv6 dashboard response: {}",
+        dashboard_test_output(response.as_bytes())
     );
 }
 
@@ -272,8 +609,8 @@ fn running_dashboard_rejects_configuration_changes() {
     assert!(
         !changed.status.success(),
         "changed allowlist unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&changed.stdout),
-        String::from_utf8_lossy(&changed.stderr)
+        dashboard_test_output(&changed.stdout),
+        dashboard_test_output(&changed.stderr)
     );
     let payload = json_output(&changed);
     assert_eq!(payload["success"], false);
@@ -297,8 +634,8 @@ fn running_dashboard_rejects_configuration_changes() {
     assert!(
         !changed.status.success(),
         "changed port unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&changed.stdout),
-        String::from_utf8_lossy(&changed.stderr)
+        dashboard_test_output(&changed.stdout),
+        dashboard_test_output(&changed.stderr)
     );
     assert!(json_output(&changed)["error"]
         .as_str()
