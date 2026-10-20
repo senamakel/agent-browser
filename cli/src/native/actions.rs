@@ -15482,7 +15482,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(state.active_provider_session.is_none());
         assert!(!state.active_provider_connection);
         let request = fs::read_to_string(request_path).unwrap();
-        assert!(request.contains(r#""type":"browser.close""#));
+        assert!(
+            request.contains(r#""type":"browser.close""#),
+            "provider close payload did not contain the expected type: {request:?}"
+        );
         assert!(request.contains(r#""sessionId":"s1""#));
     }
 
