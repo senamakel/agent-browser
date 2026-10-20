@@ -1,5 +1,12 @@
 # agent-browser
 
+## 0.38.2
+
+### Security
+
+- Updated the installer archive dependency to ZIP 9 and added coverage for corrupt, truncated, and unsafe-path archives.
+- Updated the resolved Rustls version to 0.23.46 to include current security fixes.
+
 ## 0.38.1
 
 <!-- release:start -->
