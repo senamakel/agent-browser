@@ -7755,7 +7755,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let defer_url = defer_url_until_controls || pending_session_setup.unwrap_or(false);
     #[cfg(test)]
     eprintln!(
-        "TAB_NEW_ACTION_DIAG context url_present={} domain_filter_present={} domain_count={} proxy_credentials_present={} browser_auto_attach_installed={} defer_url_until_controls={} session_setup_checked={} session_setup_pending={} defer_url={}",
+        "TAB_NEW_ACTION_DIAG context url_present={} domain_filter_present={} domain_count={} proxy_credentials_present={} browser_auto_attach_installed={} defer_url_until_controls={} session_setup_checked={} session_setup_pending={} defer_url={} recording_active={} capture_task_running={} capture_session_present={} screencasting={} stream_server_present={}",
         url.is_some(),
         domain_filter.is_some(),
         domain_filter.as_ref().map_or(0, |filter| filter.allowed_domains.len()),
@@ -7764,7 +7764,21 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         defer_url_until_controls,
         pending_session_setup.is_some(),
         pending_session_setup.unwrap_or(false),
-        defer_url
+        defer_url,
+        state.recording_state.active,
+        state
+            .recording_state
+            .capture_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        state
+            .recording_state
+            .capture_session
+            .lock()
+            .map(|capture| capture.is_some())
+            .unwrap_or(false),
+        state.screencasting,
+        state.stream_server.is_some()
     );
 
     state.ref_map.begin_snapshot();

@@ -491,15 +491,26 @@ async fn test_all_documented_actions_are_handled() {
             .to_str()
             .expect("test socket path is UTF-8"),
     );
-    let _key_guard = TestKeyGuard::new();
 
     let mut state = DaemonState::new();
     state.default_timeout_ms = 100;
     let (base_url, fixture_server) = spawn_parity_http_fixture().await;
+    let parity_started = std::time::Instant::now();
 
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
+        let action_started = std::time::Instant::now();
         let id = format!("parity-{}", i);
         let cmd = minimal_command(action, &id, &base_url);
+        let _key_guard = matches!(
+            *action,
+            "state_save"
+                | "state_load"
+                | "state_show"
+                | "credentials_set"
+                | "credentials_get"
+                | "credentials_delete"
+        )
+        .then(TestKeyGuard::new);
         #[cfg(test)]
         if *action == "tab_new" || *action == "window_new" {
             let browser = state.browser.as_ref();
@@ -538,6 +549,13 @@ async fn test_all_documented_actions_are_handled() {
                 );
             }
         }
+        #[cfg(test)]
+        eprintln!(
+            "PARITY_ACTION_DIAG phase=begin action={} action_index={} elapsed_since_start_ms={}",
+            action,
+            i,
+            parity_started.elapsed().as_millis()
+        );
         // Generous: `launch` starts a real browser, and the slowest CI target
         // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
         let result = tokio::time::timeout(
@@ -546,6 +564,17 @@ async fn test_all_documented_actions_are_handled() {
         )
         .await
         .unwrap_or_else(|_| panic!("Action '{}' timed out", action));
+        #[cfg(test)]
+        eprintln!(
+            "PARITY_ACTION_DIAG phase=complete action={} action_index={} elapsed_ms={} outcome={}",
+            action,
+            i,
+            action_started.elapsed().as_millis(),
+            result.get("success").and_then(Value::as_bool).map_or(
+                "unknown",
+                |success| if success { "success" } else { "error" }
+            )
+        );
 
         assert!(
             result.get("id").is_some(),
