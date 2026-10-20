@@ -6,6 +6,7 @@
 //! - Credential and state actions work without a browser
 
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::actions::{execute_command, DaemonState};
 
@@ -195,13 +196,18 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "mouseup",
 ];
 
-fn minimal_command(action: &str, id: &str) -> Value {
+fn minimal_command(action: &str, id: &str, base_url: &str) -> Value {
     let mut cmd = json!({ "action": action, "id": id });
     let obj = cmd.as_object_mut().unwrap();
 
     match action {
         "navigate" | "diff_url" => {
-            obj.insert("url".to_string(), json!("https://example.com"));
+            let path = if action == "diff_url" {
+                "different"
+            } else {
+                "page"
+            };
+            obj.insert("url".to_string(), json!(format!("{base_url}/{path}")));
         }
         "waitforurl" => {
             obj.insert("url".to_string(), json!("*"));
@@ -229,7 +235,7 @@ fn minimal_command(action: &str, id: &str) -> Value {
             obj.insert("value".to_string(), json!("val"));
         }
         "storage_get" | "storage_set" | "storage_clear" => {
-            obj.insert("origin".to_string(), json!("https://example.com"));
+            obj.insert("origin".to_string(), json!(base_url));
         }
         "state_save" | "state_load" | "state_show" | "state_clear" => {
             obj.insert("path".to_string(), json!("test-parity-state.json"));
@@ -343,7 +349,7 @@ fn minimal_command(action: &str, id: &str) -> Value {
             obj.insert("values".to_string(), json!([]));
         }
         "responsebody" => {
-            obj.insert("url".to_string(), json!("https://example.com"));
+            obj.insert("url".to_string(), json!(format!("{base_url}/body")));
             obj.insert("timeout".to_string(), json!(100));
         }
         "waitfordownload" => {
@@ -385,6 +391,46 @@ fn minimal_command(action: &str, id: &str) -> Value {
     cmd
 }
 
+async fn spawn_parity_http_fixture() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the parity fixture to loopback");
+    let address = listener
+        .local_addr()
+        .expect("read the parity fixture address");
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&request[..count]);
+                let path = request_line
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path == "/body" {
+                    "<html><body>response body fixture</body></html>"
+                } else if path == "/different" {
+                    "<html><body>different fixture</body></html>"
+                } else {
+                    "<html><body>parity fixture</body></html>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{address}"), server)
+}
+
 // ---------------------------------------------------------------------------
 // 1. Action dispatch coverage
 // ---------------------------------------------------------------------------
@@ -393,10 +439,11 @@ fn minimal_command(action: &str, id: &str) -> Value {
 async fn test_all_documented_actions_are_handled() {
     let mut state = DaemonState::new();
     state.default_timeout_ms = 100;
+    let (base_url, fixture_server) = spawn_parity_http_fixture().await;
 
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
         let id = format!("parity-{}", i);
-        let cmd = minimal_command(action, &id);
+        let cmd = minimal_command(action, &id, &base_url);
         // Generous: `launch` starts a real browser, and the slowest CI target
         // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
         let result = tokio::time::timeout(
@@ -420,6 +467,8 @@ async fn test_all_documented_actions_are_handled() {
             action
         );
     }
+
+    fixture_server.abort();
 }
 
 // ---------------------------------------------------------------------------

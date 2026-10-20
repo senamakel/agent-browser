@@ -12057,6 +12057,113 @@ async fn e2e_tab_new_still_activates_under_auto_attach() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_tab_new_applies_network_controls_before_first_navigation() {
+    let (guard, _dir) = binding_test_env();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let requests_for_server = requests.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let requests = requests_for_server.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                if let Ok(mut seen) = requests.lock() {
+                    seen.push(path.clone());
+                }
+
+                let (status, headers, body) = if path == "/start" {
+                    (
+                        "302 Found",
+                        format!("Location: http://127.0.0.1:{port}/blocked\r\n"),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        String::new(),
+                        "<html><body>loopback tab fixture</body></html>".to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let (mut host, ws_url) = launch_binding_host(&guard).await;
+    guard.set("AGENT_BROWSER_SESSION", "e2e-tab-new-network-controls");
+    let mut state = DaemonState::new();
+    let launched = execute_command(
+        &json!({"id":"tab-new-network-launch", "action":"launch", "cdpUrl":ws_url, "pinTab":true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&launched);
+
+    let initial = execute_command(
+        &json!({"id":"tab-new-network-initial-page", "action":"navigate", "url":"data:text/html,initial-page"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&initial);
+
+    let filter = super::network::DomainFilter::new("localhost");
+    *state.domain_filter.write().await = Some(filter.clone());
+    let manager = state.browser.as_ref().expect("browser is attached");
+    manager
+        .enable_browser_auto_attach_pub()
+        .await
+        .expect("enable browser-level auto-attach");
+    super::network::install_domain_filter(
+        &manager.client,
+        manager.active_session_id().unwrap(),
+        &filter.allowed_domains,
+        false,
+    )
+    .await
+    .expect("install controls on the current session");
+
+    let response = execute_command(
+        &json!({"id":"tab-new-network-controlled", "action":"tab_new", "url":format!("http://localhost:{port}/start")}),
+        &mut state,
+    )
+    .await;
+    assert_success(&response);
+
+    let seen = requests.lock().unwrap().clone();
+    assert!(seen.iter().any(|path| path == "/start"), "{seen:?}");
+    assert!(
+        !seen.iter().any(|path| path == "/blocked"),
+        "the disallowed redirect must be intercepted before reaching the loopback server: {seen:?}"
+    );
+
+    let _ = execute_command(
+        &json!({"id":"tab-new-network-close", "action":"close"}),
+        &mut state,
+    )
+    .await;
+    let _ = execute_command(
+        &json!({"id":"tab-new-host-close", "action":"close"}),
+        &mut host,
+    )
+    .await;
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_pin_tab_gone_error_and_recovery() {
     let (guard, _dir) = binding_test_env();
     let (mut host, ws_url) = launch_binding_host(&guard).await;
