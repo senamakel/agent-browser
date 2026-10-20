@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, epic/8056-modules-wiring]
   workflow_dispatch:
+    inputs:
+      windows_lib_diagnostic_only:
+        description: Run the unfiltered Windows library diagnostic without full Rust and native jobs.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   version-sync:
@@ -43,6 +49,7 @@ jobs:
 
   rust:
     name: Rust
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_lib_diagnostic_only != true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -139,7 +146,7 @@ jobs:
 
   rust-cross:
     name: Rust (${{ matrix.os }} - ${{ matrix.target }})
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.windows_lib_diagnostic_only != true)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -171,7 +178,7 @@ jobs:
 
   windows-dashboard-cli-diagnostic:
     name: Windows dashboard CLI diagnostic
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_lib_diagnostic_only != true
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -209,7 +216,7 @@ jobs:
 
   windows-tabnew-regressions:
     name: Windows tab_new regressions
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_lib_diagnostic_only != true
     runs-on: windows-latest
     timeout-minutes: 25
     env:
@@ -300,7 +307,7 @@ jobs:
 
   native-e2e:
     name: Native E2E Tests
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.windows_lib_diagnostic_only != true)
     runs-on: ubuntu-latest
     needs: rust
     steps:
@@ -327,7 +334,7 @@ jobs:
 
   windows-integration:
     name: Windows Integration Test
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.windows_lib_diagnostic_only != true)
     runs-on: windows-latest
     needs: rust-cross
 
@@ -384,7 +391,7 @@ jobs:
 
   global-install:
     name: Global Install (${{ matrix.os }})
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.windows_lib_diagnostic_only != true)
     runs-on: ${{ matrix.os }}
     needs: rust-cross
     strategy:
