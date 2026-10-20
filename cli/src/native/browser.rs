@@ -13,6 +13,29 @@ use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
 use super::tab_binding;
 
+#[cfg(test)]
+macro_rules! trace_test_browser_stage {
+    ($stage:literal, $future:expr $(,)?) => {{
+        let started = Instant::now();
+        eprintln!("BROWSER_TAB_NEW_DIAG stage={} state=begin", $stage);
+        let result = $future.await;
+        eprintln!(
+            "BROWSER_TAB_NEW_DIAG stage={} state=complete elapsed_ms={} outcome={}",
+            $stage,
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_test_browser_stage {
+    ($stage:literal, $future:expr $(,)?) => {
+        $future.await
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Launch validation
 // ---------------------------------------------------------------------------
@@ -376,6 +399,14 @@ pub enum BrowserProcess {
 }
 
 impl BrowserProcess {
+    #[cfg(all(test, windows))]
+    pub fn stderr_pending_bytes(&self) -> Option<u32> {
+        match self {
+            BrowserProcess::Chrome(process) => process.stderr_pending_bytes(),
+            BrowserProcess::Lightpanda(_) => None,
+        }
+    }
+
     pub fn kill(&mut self) {
         match self {
             BrowserProcess::Chrome(p) => p.kill(),
@@ -843,27 +874,34 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
-        self.client
-            .send_command_no_params("Page.enable", Some(session_id))
-            .await?;
-        self.client
-            .send_command_no_params("Runtime.enable", Some(session_id))
-            .await?;
-        self.client
-            .send_command_no_params("Network.enable", Some(session_id))
-            .await?;
-        let _ = self
-            .client
-            .send_command_no_params("WebMCP.enable", Some(session_id))
-            .await;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.page_enable",
+            self.client
+                .send_command_no_params("Page.enable", Some(session_id))
+        )?;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.runtime_enable",
+            self.client
+                .send_command_no_params("Runtime.enable", Some(session_id))
+        )?;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.network_enable",
+            self.client
+                .send_command_no_params("Network.enable", Some(session_id))
+        )?;
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.webmcp_enable",
+            self.client
+                .send_command_no_params("WebMCP.enable", Some(session_id))
+        );
         // Enable auto-attach for cross-origin iframe support.
         // flatten: true gives each iframe its own session_id.
         // waitForDebuggerOnStart keeps child targets paused until the daemon
         // installs any required network controls and explicitly resumes them.
         // Ignored on engines that don't support it (e.g. Lightpanda).
-        let _ = self
-            .client
-            .send_command(
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.target_auto_attach",
+            self.client.send_command(
                 "Target.setAutoAttach",
                 Some(json!({
                     "autoAttach": true,
@@ -872,7 +910,7 @@ impl BrowserManager {
                 })),
                 Some(session_id),
             )
-            .await;
+        );
         Ok(())
     }
 
@@ -985,10 +1023,14 @@ impl BrowserManager {
     async fn resume_if_waiting(&self, session_id: &str) -> Result<(), String> {
         // Needed for real browser sessions (Chrome 144+) where targets are
         // paused after attach until explicitly resumed. No-op otherwise.
-        let _ = self
-            .client
-            .send_command_no_wait("Runtime.runIfWaitingForDebugger", None, Some(session_id))
-            .await;
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.resume_if_waiting",
+            self.client.send_command_no_wait(
+                "Runtime.runIfWaitingForDebugger",
+                None,
+                Some(session_id)
+            )
+        );
         Ok(())
     }
 
@@ -1408,6 +1450,13 @@ impl BrowserManager {
         }
     }
 
+    #[cfg(all(test, windows))]
+    fn stderr_pending_bytes(&self) -> Option<u32> {
+        self.browser_process
+            .as_ref()
+            .and_then(BrowserProcess::stderr_pending_bytes)
+    }
+
     pub fn get_cdp_url(&self) -> &str {
         &self.ws_url
     }
@@ -1618,6 +1667,9 @@ impl BrowserManager {
         url: Option<&str>,
         label: Option<&str>,
     ) -> Result<Value, String> {
+        #[cfg(test)]
+        let mut target_events = self.client.subscribe();
+
         if let Some(label) = label {
             if !is_valid_label(label) {
                 return Err(format!(
@@ -1637,30 +1689,157 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
+        let result: CreateTargetResult = trace_test_browser_stage!(
+            "browser.tab_new.create_target",
+            self.client.send_command_typed(
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
                 },
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
+        let attach: AttachToTargetResult = trace_test_browser_stage!(
+            "browser.tab_new.attach_target",
+            self.client.send_command_typed(
                 "Target.attachToTarget",
                 &AttachToTargetParams {
                     target_id: result.target_id.clone(),
                     flatten: true,
                 },
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        self.enable_domains(&attach.session_id).await?;
+        let enable_result = trace_test_browser_stage!(
+            "browser.tab_new.enable_domains",
+            self.enable_domains(&attach.session_id)
+        );
+        #[cfg(test)]
+        if let Err(error) = &enable_result {
+            const MAX_TARGET_EVENT_PROBE_READS: usize = 1_024;
+            let mut attached_event_matched = false;
+            let mut waiting_for_debugger = None;
+            let mut destroyed_event_matched = false;
+            let mut detached_event_matched = false;
+            let mut event_probe_reads = 0;
+            let mut events_examined = 0;
+            let mut skipped_events = 0_u64;
+            while event_probe_reads < MAX_TARGET_EVENT_PROBE_READS {
+                event_probe_reads += 1;
+                match target_events.try_recv() {
+                    Ok(event) => {
+                        events_examined += 1;
+                        match event.method.as_str() {
+                            "Target.attachedToTarget" => {
+                                let matches_target = event
+                                    .params
+                                    .get("targetInfo")
+                                    .and_then(|info| info.get("targetId"))
+                                    .and_then(Value::as_str)
+                                    == Some(result.target_id.as_str());
+                                if matches_target {
+                                    attached_event_matched = true;
+                                    waiting_for_debugger = event
+                                        .params
+                                        .get("waitingForDebugger")
+                                        .and_then(Value::as_bool);
+                                }
+                            }
+                            "Target.targetDestroyed" => {
+                                destroyed_event_matched |=
+                                    event.params.get("targetId").and_then(Value::as_str)
+                                        == Some(result.target_id.as_str());
+                            }
+                            "Target.detachedFromTarget" => {
+                                detached_event_matched |=
+                                    event.params.get("sessionId").and_then(Value::as_str)
+                                        == Some(attach.session_id.as_str());
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        skipped_events = skipped_events.saturating_add(skipped);
+                    }
+                    Err(
+                        tokio::sync::broadcast::error::TryRecvError::Empty
+                        | tokio::sync::broadcast::error::TryRecvError::Closed,
+                    ) => break,
+                }
+            }
+
+            let browser_health = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client
+                    .send_command_no_params("Browser.getVersion", None),
+            )
+            .await;
+            let browser_health = match browser_health {
+                Ok(Ok(_)) => "ok",
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+            let target_health = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client.send_command(
+                    "Target.getTargetInfo",
+                    Some(json!({ "targetId": result.target_id })),
+                    None,
+                ),
+            )
+            .await;
+            let (target_health, target_type, target_attached) = match target_health {
+                Ok(Ok(info)) => {
+                    let target_info = info.get("targetInfo");
+                    (
+                        "ok",
+                        target_info
+                            .and_then(|target| target.get("type"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        target_info
+                            .and_then(|target| target.get("attached"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    )
+                }
+                Ok(Err(_)) => ("error", "unknown".to_string(), false),
+                Err(_) => ("timeout", "unknown".to_string(), false),
+            };
+            let browser_process_exited = self.has_process_exited();
+            #[cfg(all(test, windows))]
+            let stderr_pending_bytes = self.stderr_pending_bytes();
+            #[cfg(not(all(test, windows)))]
+            let stderr_pending_bytes: Option<u32> = None;
+            let error_class = if error.contains("CDP command timed out: Page.enable") {
+                "cdp_timeout"
+            } else if error.starts_with("CDP error (Page.enable)") {
+                "cdp_error"
+            } else {
+                "other_error"
+            };
+            eprintln!(
+                "TAB_NEW_FAILURE_DIAG error_class={} matched_attach_event={} waiting_for_debugger={} matched_destroyed_event={} matched_detached_event={} events_examined={} skipped_events={} events_truncated={} browser_health={} target_health={} target_type={} target_attached={} browser_process_exited={} stderr_pending_bytes={}",
+                error_class,
+                attached_event_matched,
+                waiting_for_debugger.map_or("unknown", |waiting| if waiting { "true" } else { "false" }),
+                destroyed_event_matched,
+                detached_event_matched,
+                events_examined,
+                skipped_events,
+                event_probe_reads == MAX_TARGET_EVENT_PROBE_READS,
+                browser_health,
+                target_health,
+                target_type,
+                target_attached,
+                browser_process_exited,
+                stderr_pending_bytes.map_or("unknown".to_string(), |bytes| bytes.to_string())
+            );
+        }
+        enable_result?;
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;

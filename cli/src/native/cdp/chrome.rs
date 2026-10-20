@@ -61,6 +61,11 @@ impl PreparedNssHome {
 }
 
 impl ChromeProcess {
+    #[cfg(all(test, windows))]
+    pub fn stderr_pending_bytes(&self) -> Option<u32> {
+        self.child.stderr_pending_bytes()
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         // On Unix, kill the entire process group to ensure Chrome helper

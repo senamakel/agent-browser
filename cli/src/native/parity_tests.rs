@@ -6,10 +6,52 @@
 //! - Credential and state actions work without a browser
 
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::actions::{execute_command, DaemonState};
 
 const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
+
+const PARITY_TEST_ENV: &[&str] = &[
+    "AGENT_BROWSER_SESSION",
+    "AGENT_BROWSER_SESSION_NAME",
+    "AGENT_BROWSER_NAMESPACE",
+    "AGENT_BROWSER_SOCKET_DIR",
+    "AGENT_BROWSER_PIN_TAB",
+    "AGENT_BROWSER_ALLOWED_DOMAINS",
+    "AGENT_BROWSER_NO_AUTO_DIALOG",
+    "AGENT_BROWSER_ENGINE",
+    "AGENT_BROWSER_DEFAULT_TIMEOUT",
+    "AGENT_BROWSER_CONFIRM_ACTIONS",
+    "AGENT_BROWSER_ACTION_POLICY",
+    "AGENT_BROWSER_POLICY",
+    "AGENT_BROWSER_RESTORE_SAVE",
+    "AGENT_BROWSER_RESTORE_CHECK_URL",
+    "AGENT_BROWSER_RESTORE_CHECK_TEXT",
+    "AGENT_BROWSER_RESTORE_CHECK_FN",
+    "AGENT_BROWSER_PROVIDER",
+    "AGENT_BROWSER_CDP",
+    "AGENT_BROWSER_AUTO_CONNECT",
+    "AGENT_BROWSER_ENABLE",
+    "AGENT_BROWSER_INIT_SCRIPTS",
+    "AGENT_BROWSER_EXTENSIONS",
+    "AGENT_BROWSER_PROXY",
+    "AGENT_BROWSER_PROXY_BYPASS",
+    "AGENT_BROWSER_PROXY_USERNAME",
+    "AGENT_BROWSER_PROXY_PASSWORD",
+    "AGENT_BROWSER_PROFILE",
+    "AGENT_BROWSER_ALLOW_FILE_ACCESS",
+    "AGENT_BROWSER_STATE",
+    "AGENT_BROWSER_USER_AGENT",
+    "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+    "AGENT_BROWSER_COLOR_SCHEME",
+    "AGENT_BROWSER_DOWNLOAD_PATH",
+    "AGENT_BROWSER_HIDE_SCROLLBARS",
+    "AGENT_BROWSER_WEBGPU",
+    "AGENT_BROWSER_NO_WEBMCP",
+    "AGENT_BROWSER_NO_XVFB",
+    "AGENT_BROWSER_PLUGINS",
+];
 
 struct TestKeyGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -195,13 +237,18 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "mouseup",
 ];
 
-fn minimal_command(action: &str, id: &str) -> Value {
+fn minimal_command(action: &str, id: &str, base_url: &str) -> Value {
     let mut cmd = json!({ "action": action, "id": id });
     let obj = cmd.as_object_mut().unwrap();
 
     match action {
         "navigate" | "diff_url" => {
-            obj.insert("url".to_string(), json!("https://example.com"));
+            let path = if action == "diff_url" {
+                "different"
+            } else {
+                "page"
+            };
+            obj.insert("url".to_string(), json!(format!("{base_url}/{path}")));
         }
         "waitforurl" => {
             obj.insert("url".to_string(), json!("*"));
@@ -229,7 +276,7 @@ fn minimal_command(action: &str, id: &str) -> Value {
             obj.insert("value".to_string(), json!("val"));
         }
         "storage_get" | "storage_set" | "storage_clear" => {
-            obj.insert("origin".to_string(), json!("https://example.com"));
+            obj.insert("origin".to_string(), json!(base_url));
         }
         "state_save" | "state_load" | "state_show" | "state_clear" => {
             obj.insert("path".to_string(), json!("test-parity-state.json"));
@@ -343,7 +390,7 @@ fn minimal_command(action: &str, id: &str) -> Value {
             obj.insert("values".to_string(), json!([]));
         }
         "responsebody" => {
-            obj.insert("url".to_string(), json!("https://example.com"));
+            obj.insert("url".to_string(), json!(format!("{base_url}/body")));
             obj.insert("timeout".to_string(), json!(100));
         }
         "waitfordownload" => {
@@ -385,18 +432,130 @@ fn minimal_command(action: &str, id: &str) -> Value {
     cmd
 }
 
+async fn spawn_parity_http_fixture() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the parity fixture to loopback");
+    let address = listener
+        .local_addr()
+        .expect("read the parity fixture address");
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&request[..count]);
+                let path = request_line
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path == "/body" {
+                    "<html><body>response body fixture</body></html>"
+                } else if path == "/different" {
+                    "<html><body>different fixture</body></html>"
+                } else {
+                    "<html><body>parity fixture</body></html>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{address}"), server)
+}
+
 // ---------------------------------------------------------------------------
 // 1. Action dispatch coverage
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_all_documented_actions_are_handled() {
+    let env_guard = crate::test_utils::EnvGuard::new(PARITY_TEST_ENV);
+    let socket_dir = tempfile::tempdir().unwrap();
+    for name in PARITY_TEST_ENV {
+        env_guard.remove(name);
+    }
+    env_guard.set("AGENT_BROWSER_SESSION", "documented-actions-parity");
+    env_guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir
+            .path()
+            .to_str()
+            .expect("test socket path is UTF-8"),
+    );
+
     let mut state = DaemonState::new();
     state.default_timeout_ms = 100;
+    let (base_url, fixture_server) = spawn_parity_http_fixture().await;
+    let parity_started = std::time::Instant::now();
 
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
+        let action_started = std::time::Instant::now();
         let id = format!("parity-{}", i);
-        let cmd = minimal_command(action, &id);
+        let cmd = minimal_command(action, &id, &base_url);
+        let _key_guard = matches!(
+            *action,
+            "state_save"
+                | "state_load"
+                | "state_show"
+                | "credentials_set"
+                | "credentials_get"
+                | "credentials_delete"
+        )
+        .then(TestKeyGuard::new);
+        #[cfg(test)]
+        if *action == "tab_new" || *action == "window_new" {
+            let browser = state.browser.as_ref();
+            eprintln!(
+                "PARITY_BROWSER_ACTION_CONTEXT action={} action_index={} browser_present={} browser_owned={} tracked_pages={} active_session_present={} default_timeout_ms={} profile_mode=default_ephemeral",
+                action,
+                i,
+                browser.is_some(),
+                browser.is_some_and(|manager| !manager.is_cdp_connection()),
+                browser.map_or(0, |manager| manager.page_count()),
+                browser.is_some_and(|manager| manager.active_session_id().is_ok()),
+                state.default_timeout_ms
+            );
+            if *action == "tab_new" {
+                let (domain_filter_present, domain_count) = {
+                    let filter = state.domain_filter.read().await;
+                    (
+                        filter.is_some(),
+                        filter
+                            .as_ref()
+                            .map_or(0, |value| value.allowed_domains.len()),
+                    )
+                };
+                let proxy_credentials_present = state.proxy_credentials.read().await.is_some();
+                eprintln!(
+                    "PARITY_TAB_NEW_CONTEXT domain_filter_present={} domain_count={} proxy_credentials_present={} executable_selection={} launch_args_present={}",
+                    domain_filter_present,
+                    domain_count,
+                    proxy_credentials_present,
+                    if std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH").is_some() {
+                        "explicit_env"
+                    } else {
+                        "path_resolution"
+                    },
+                    std::env::var_os("AGENT_BROWSER_ARGS").is_some()
+                );
+            }
+        }
+        #[cfg(test)]
+        eprintln!(
+            "PARITY_ACTION_DIAG phase=begin action={} action_index={} elapsed_since_start_ms={}",
+            action,
+            i,
+            parity_started.elapsed().as_millis()
+        );
         // Generous: `launch` starts a real browser, and the slowest CI target
         // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
         let result = tokio::time::timeout(
@@ -405,6 +564,17 @@ async fn test_all_documented_actions_are_handled() {
         )
         .await
         .unwrap_or_else(|_| panic!("Action '{}' timed out", action));
+        #[cfg(test)]
+        eprintln!(
+            "PARITY_ACTION_DIAG phase=complete action={} action_index={} elapsed_ms={} outcome={}",
+            action,
+            i,
+            action_started.elapsed().as_millis(),
+            result.get("success").and_then(Value::as_bool).map_or(
+                "unknown",
+                |success| if success { "success" } else { "error" }
+            )
+        );
 
         assert!(
             result.get("id").is_some(),
@@ -414,12 +584,50 @@ async fn test_all_documented_actions_are_handled() {
 
         let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
 
+        #[cfg(test)]
+        if *action == "launch" && result.get("success").and_then(Value::as_bool) == Some(true) {
+            let browser_version = if let Some(manager) = state.browser.as_ref() {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    manager
+                        .client
+                        .send_command_no_params("Browser.getVersion", None),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            } else {
+                None
+            };
+            let product = browser_version
+                .as_ref()
+                .and_then(|version| version.get("product"))
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            let (browser_name, full_version) = product.split_once('/').unwrap_or((product, ""));
+            let major = full_version.split('.').next().unwrap_or("unknown");
+            eprintln!(
+                "PARITY_BROWSER_LAUNCH engine={} browser_name={} browser_major={} browser_version_available={} selection_source={}",
+                state.engine.as_str(),
+                browser_name,
+                major,
+                browser_version.is_some(),
+                if std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH").is_some() {
+                    "explicit_env"
+                } else {
+                    "path_resolution"
+                }
+            );
+        }
+
         assert!(
             !error.contains("Not yet implemented"),
             "Action '{}' returned 'Not yet implemented')",
             action
         );
     }
+
+    fixture_server.abort();
 }
 
 // ---------------------------------------------------------------------------

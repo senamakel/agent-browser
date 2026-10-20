@@ -28,6 +28,8 @@ use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+#[cfg(test)]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, CreateDesktopW, DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
     HDESK,
@@ -183,6 +185,25 @@ impl Child {
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.wait_for(0)
+    }
+
+    #[cfg(test)]
+    pub fn stderr_pending_bytes(&self) -> Option<u32> {
+        let stderr = self.stderr.as_ref()?;
+        let mut available = 0;
+        // SAFETY: PeekNamedPipe only inspects this child-owned pipe handle;
+        // it does not consume or expose any stderr contents.
+        let succeeded = unsafe {
+            PeekNamedPipe(
+                stderr.as_raw_handle() as HANDLE,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        };
+        (succeeded != 0).then_some(available)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {

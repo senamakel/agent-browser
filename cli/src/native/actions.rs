@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
@@ -43,8 +45,54 @@ use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
 use super::webdriver::ios;
+
+#[cfg(test)]
+macro_rules! trace_test_action_stage {
+    ($stage:literal, $future:expr $(,)?) => {{
+        let started = Instant::now();
+        eprintln!("TAB_NEW_ACTION_DIAG stage={} state=begin", $stage);
+        let result = $future.await;
+        eprintln!(
+            "TAB_NEW_ACTION_DIAG stage={} state=complete elapsed_ms={} outcome={}",
+            $stage,
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_test_action_stage {
+    ($stage:literal, $future:expr $(,)?) => {
+        $future.await
+    };
+}
 use super::webdriver::safari;
 use super::webmcp;
+
+#[cfg(test)]
+macro_rules! trace_test_cdp_stage {
+    ($stage:literal, $future:expr $(,)?) => {{
+        let started = std::time::Instant::now();
+        eprintln!("WINDOW_NEW_DIAG stage={} state=begin", $stage);
+        let result = $future.await;
+        eprintln!(
+            "WINDOW_NEW_DIAG stage={} state=complete elapsed_ms={} outcome={}",
+            $stage,
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_test_cdp_stage {
+    ($stage:literal, $future:expr $(,)?) => {
+        $future.await
+    };
+}
 
 /// Wait strategy used by `auth_login` when navigating to the login page.
 ///
@@ -1304,6 +1352,25 @@ impl DaemonState {
 
     pub async fn drain_cdp_events_background(&mut self) -> Result<(), String> {
         let drained = self.drain_cdp_events();
+        #[cfg(test)]
+        if !drained.new_targets.is_empty() || !drained.destroyed_targets.is_empty() {
+            let same_batch_create_destroy = drained
+                .new_targets
+                .iter()
+                .filter(|created| {
+                    drained
+                        .destroyed_targets
+                        .iter()
+                        .any(|destroyed| destroyed == &created.target_info.target_id)
+                })
+                .count();
+            eprintln!(
+                "CDP_TARGET_DRAIN new_targets={} destroyed_targets={} same_batch_create_destroy={}",
+                drained.new_targets.len(),
+                drained.destroyed_targets.len(),
+                same_batch_create_destroy
+            );
+        }
         self.apply_drained_events(drained).await
     }
 
@@ -1531,39 +1598,44 @@ impl DaemonState {
             let controls_active = filter.is_some() || has_proxy_creds;
             let setup_result = if let Some(ref mut mgr) = self.browser {
                 async {
-                    let attach: AttachToTargetResult = mgr
-                        .client
-                        .send_command_typed(
+                    let attach: AttachToTargetResult = trace_test_cdp_stage!(
+                        "drain_new_target.attach",
+                        mgr.client.send_command_typed(
                             "Target.attachToTarget",
                             &AttachToTargetParams {
                                 target_id: te.target_info.target_id.clone(),
                                 flatten: true,
                             },
                             None,
-                        )
-                        .await?;
-                    mgr.prepare_domains_pub(&attach.session_id).await?;
+                        ),
+                    )?;
+                    trace_test_cdp_stage!(
+                        "drain_new_target.prepare_domains",
+                        mgr.prepare_domains_pub(&attach.session_id)
+                    )?;
                     if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            &attach.session_id,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
+                        trace_test_cdp_stage!(
+                            "drain_new_target.network_controls",
+                            install_network_controls_for_session(
+                                &mgr.client,
+                                &attach.session_id,
+                                filter.as_ref(),
+                                has_proxy_creds,
+                            )
+                        )?;
                     }
 
                     let mut page_url = te.target_info.url.clone();
                     if let Some(ref filter) = filter {
                         if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
+                            let _ = trace_test_cdp_stage!(
+                                "drain_new_target.blank_existing_url",
+                                mgr.client.send_command(
                                     "Page.navigate",
                                     Some(json!({ "url": "about:blank" })),
                                     Some(&attach.session_id),
-                                )
-                                .await;
+                                ),
+                            );
                             page_url = "about:blank".to_string();
                         }
                     }
@@ -1583,7 +1655,10 @@ impl DaemonState {
                         te.target_info.title.clone(),
                         te.target_info.target_type.clone(),
                     );
-                    mgr.resume_if_waiting_pub(&attach.session_id).await
+                    trace_test_cdp_stage!(
+                        "drain_new_target.resume",
+                        mgr.resume_if_waiting_pub(&attach.session_id)
+                    )
                 }
                 .await
             } else {
@@ -1811,6 +1886,24 @@ impl DaemonState {
                             continue;
                         }
                         "Target.attachedToTarget" => {
+                            #[cfg(test)]
+                            {
+                                let target_type = event
+                                    .params
+                                    .get("targetInfo")
+                                    .and_then(|value| value.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                let waiting_for_debugger = event
+                                    .params
+                                    .get("waitingForDebugger")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                eprintln!(
+                                    "CDP_ATTACH_DIAG target_type={} waiting_for_debugger={}",
+                                    target_type, waiting_for_debugger
+                                );
+                            }
                             if let (Some(sid), Some(target_info_value)) = (
                                 event.params.get("sessionId").and_then(|v| v.as_str()),
                                 event.params.get("targetInfo"),
@@ -7654,8 +7747,39 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     // UA, init scripts, headers, and routes are per-session in CDP, so when
     // any are configured the tab is created blank and navigated only after
     // they are replayed onto it; otherwise the first document would miss them.
-    let defer_url =
-        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
+    let pending_session_setup = if !defer_url_until_controls && url.is_some() {
+        Some(session_setup_pending(state).await)
+    } else {
+        None
+    };
+    let defer_url = defer_url_until_controls || pending_session_setup.unwrap_or(false);
+    #[cfg(test)]
+    eprintln!(
+        "TAB_NEW_ACTION_DIAG context url_present={} domain_filter_present={} domain_count={} proxy_credentials_present={} browser_auto_attach_installed={} defer_url_until_controls={} session_setup_checked={} session_setup_pending={} defer_url={} recording_active={} capture_task_running={} capture_session_present={} screencasting={} stream_server_present={}",
+        url.is_some(),
+        domain_filter.is_some(),
+        domain_filter.as_ref().map_or(0, |filter| filter.allowed_domains.len()),
+        has_proxy_creds,
+        state.network_auto_attach_installed,
+        defer_url_until_controls,
+        pending_session_setup.is_some(),
+        pending_session_setup.unwrap_or(false),
+        defer_url,
+        state.recording_state.active,
+        state
+            .recording_state
+            .capture_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        state
+            .recording_state
+            .capture_session
+            .lock()
+            .map(|capture| capture.is_some())
+            .unwrap_or(false),
+        state.screencasting,
+        state.stream_server.is_some()
+    );
 
     state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
@@ -7663,22 +7787,35 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.webmcp.clear_invocations();
     let (mut result, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let result = mgr
-            .tab_new(if defer_url { None } else { url }, label)
-            .await?;
+        let result = trace_test_action_stage!(
+            "handle_tab_new.browser_tab_new",
+            mgr.tab_new(if defer_url { None } else { url }, label)
+        )?;
         (result, mgr.active_session_id()?.to_string())
     };
 
-    apply_session_setup(state, &new_session_id).await?;
-    install_network_controls_or_close(state, has_proxy_creds).await?;
-    state.drain_cdp_events_background().await?;
+    trace_test_action_stage!(
+        "handle_tab_new.apply_session_setup",
+        apply_session_setup(state, &new_session_id)
+    )?;
+    trace_test_action_stage!(
+        "handle_tab_new.install_network_controls",
+        install_network_controls_or_close(state, has_proxy_creds)
+    )?;
+    trace_test_action_stage!(
+        "handle_tab_new.drain_cdp_events",
+        state.drain_cdp_events_background()
+    )?;
 
     if defer_url {
         if let Some(url) = url {
-            let nav = {
-                let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-                mgr.navigate(url, WaitUntil::Load).await?
-            };
+            let nav = trace_test_action_stage!("handle_tab_new.navigate", async {
+                let mgr = state
+                    .browser
+                    .as_mut()
+                    .ok_or_else(|| "Browser not launched".to_string())?;
+                mgr.navigate(url, WaitUntil::Load).await
+            })?;
             if let Some(obj) = result.as_object_mut() {
                 if let Some(value) = nav.get("url") {
                     obj.insert("url".to_string(), value.clone());
@@ -11207,38 +11344,42 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
         // Create a new browser context
-        let context_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
+        let context_result = trace_test_cdp_stage!(
+            "window_new.create_browser_context",
+            mgr.client
+                .send_command_no_params("Target.createBrowserContext", None)
+        )?;
         let context_id = context_result
             .get("browserContextId")
             .and_then(|v| v.as_str())
             .ok_or("Failed to create browser context")?
             .to_string();
 
-        let create_result: super::cdp::types::CreateTargetResult = mgr
-            .client
-            .send_command_typed(
+        let create_result: super::cdp::types::CreateTargetResult = trace_test_cdp_stage!(
+            "window_new.create_target",
+            mgr.client.send_command_typed(
                 "Target.createTarget",
                 &json!({ "url": "about:blank", "browserContextId": context_id }),
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        let attach: super::cdp::types::AttachToTargetResult = mgr
-            .client
-            .send_command_typed(
+        let attach: super::cdp::types::AttachToTargetResult = trace_test_cdp_stage!(
+            "window_new.attach_target",
+            mgr.client.send_command_typed(
                 "Target.attachToTarget",
                 &super::cdp::types::AttachToTargetParams {
                     target_id: create_result.target_id.clone(),
                     flatten: true,
                 },
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        mgr.prepare_domains_pub(&attach.session_id).await?;
+        trace_test_cdp_stage!(
+            "window_new.prepare_domains",
+            mgr.prepare_domains_pub(&attach.session_id)
+        )?;
 
         let tab_id = mgr.assign_tab_id();
         mgr.add_page(super::browser::PageInfo {
@@ -11254,9 +11395,14 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
     };
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
-    install_network_controls_or_resume_prepared_session(state, has_proxy_creds, &session_id)
-        .await?;
-    state.drain_cdp_events_background().await?;
+    trace_test_cdp_stage!(
+        "window_new.network_controls",
+        install_network_controls_or_resume_prepared_session(state, has_proxy_creds, &session_id)
+    )?;
+    trace_test_cdp_stage!(
+        "window_new.drain_events",
+        state.drain_cdp_events_background()
+    )?;
 
     if let Some(viewport) = cmd.get("viewport") {
         let width = viewport
@@ -15482,7 +15628,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(state.active_provider_session.is_none());
         assert!(!state.active_provider_connection);
         let request = fs::read_to_string(request_path).unwrap();
-        assert!(request.contains(r#""type":"browser.close""#));
+        assert!(
+            request.contains(r#""type":"browser.close""#),
+            "provider close payload did not contain the expected type: {request:?}"
+        );
         assert!(request.contains(r#""sessionId":"s1""#));
     }
 
