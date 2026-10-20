@@ -1308,7 +1308,12 @@ async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
 #[tokio::test]
 #[ignore]
 async fn e2e_snapshot_and_click_ref() {
+    let (fixture_url, fixture_server) = start_snapshot_ref_server().await;
     let mut state = DaemonState::new();
+    {
+        let mut domain_filter = state.domain_filter.write().await;
+        *domain_filter = Some(super::network::DomainFilter::new("127.0.0.1"));
+    }
 
     let resp = execute_command(
         &json!({ "id": "1", "action": "launch", "headless": true }),
@@ -1318,7 +1323,7 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": fixture_url }),
         &mut state,
     )
     .await;
@@ -1347,21 +1352,24 @@ async fn e2e_snapshot_and_click_ref() {
     .await;
     assert_success(&resp);
 
-    // Wait for navigation
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    // Verify URL changed
-    let resp = execute_command(&json!({ "id": "5", "action": "url" }), &mut state).await;
-    assert_success(&resp);
-    let url = get_data(&resp)["url"].as_str().unwrap();
-    assert!(
-        url.contains("iana.org"),
-        "Should have navigated to iana.org, got: {}",
-        url
-    );
+    // Verify the click navigated to the fixture's second page.
+    let destination_url = format!("{fixture_url}/destination");
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+        loop {
+            let resp = execute_command(&json!({ "id": "5", "action": "url" }), &mut state).await;
+            assert_success(&resp);
+            if get_data(&resp)["url"].as_str() == Some(destination_url.as_str()) {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("click should navigate to the local destination page");
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
+    fixture_server.abort();
 }
 
 #[tokio::test]
@@ -5803,6 +5811,35 @@ async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
     });
 
     (base_url, handle)
+}
+
+async fn start_snapshot_ref_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body = if request.starts_with("GET /destination ") {
+                    "<!doctype html><title>Destination</title><h1>Destination page</h1>"
+                } else {
+                    "<!doctype html><title>Example Domain</title><h1>Example Domain</h1><p>Example text.</p><a href=\"/destination\">More information...</a>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
 }
 
 async fn start_webmcp_server() -> (String, tokio::task::JoinHandle<()>) {
