@@ -16,9 +16,38 @@ use std::path::PathBuf;
 use std::process::{exit, Command};
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::CloseHandle;
+use std::ffi::c_void;
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::OpenProcess;
+use std::io;
+#[cfg(windows)]
+use std::marker::PhantomData;
+#[cfg(windows)]
+use std::mem::{size_of, size_of_val};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(windows)]
+use std::ptr::{null, null_mut};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_GREATER_THAN, CSTR_LESS_THAN};
+#[cfg(windows)]
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+    GENERIC_WRITE, OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, OpenProcess,
+    TerminateProcess, UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+};
 
 use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
@@ -950,6 +979,399 @@ fn write_dashboard_config(config: &DashboardConfig) -> std::io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+struct DashboardProcess {
+    id: u32,
+    handle: OwnedHandle,
+}
+
+#[cfg(not(windows))]
+struct DashboardProcess(std::process::Child);
+
+impl DashboardProcess {
+    fn id(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            self.id
+        }
+        #[cfg(not(windows))]
+        {
+            self.0.id()
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            // SAFETY: This is the process handle returned by CreateProcessW.
+            if unsafe { TerminateProcess(self.handle.as_raw_handle() as HANDLE, 1) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.0.kill()
+        }
+    }
+}
+
+#[cfg(windows)]
+struct DashboardAttributeList(Vec<usize>);
+
+#[cfg(windows)]
+impl DashboardAttributeList {
+    fn new(handle_count: u32) -> io::Result<Self> {
+        let mut byte_count = 0;
+        // SAFETY: The first call only queries the required allocation size.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), handle_count, 0, &mut byte_count) };
+        if byte_count == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut storage = vec![0usize; byte_count.div_ceil(size_of::<usize>())];
+        // SAFETY: The storage is pointer-aligned and sized as requested.
+        if unsafe {
+            InitializeProcThreadAttributeList(
+                storage.as_mut_ptr().cast(),
+                handle_count,
+                0,
+                &mut byte_count,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(storage))
+    }
+
+    fn as_ptr(&mut self) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.0.as_mut_ptr().cast()
+    }
+
+    fn allow_handles(&mut self, handles: &[HANDLE]) -> io::Result<()> {
+        // SAFETY: The handle array remains alive through CreateProcessW.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                size_of_val(handles),
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DashboardAttributeList {
+    fn drop(&mut self) {
+        // SAFETY: Instances are constructed only after successful initialization.
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
+}
+
+#[cfg(windows)]
+struct InheritedEnvironment(*mut u16);
+
+#[cfg(windows)]
+impl InheritedEnvironment {
+    fn new() -> io::Result<Self> {
+        // SAFETY: The returned environment block is released in Drop.
+        let block = unsafe { GetEnvironmentStringsW() };
+        if block.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(block))
+        }
+    }
+
+    fn entries(&self) -> Vec<Vec<u16>> {
+        let mut entries = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        // SAFETY: Windows returns a double-NUL-terminated environment block.
+        unsafe {
+            loop {
+                let unit = *self.0.add(index);
+                if unit == 0 {
+                    if index == start {
+                        break;
+                    }
+                    entries.push(
+                        std::slice::from_raw_parts(self.0.add(start), index - start).to_vec(),
+                    );
+                    start = index + 1;
+                }
+                index += 1;
+            }
+        }
+        entries
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InheritedEnvironment {
+    fn drop(&mut self) {
+        // SAFETY: This is the block returned by GetEnvironmentStringsW.
+        unsafe { FreeEnvironmentStringsW(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn environment_entry_name(entry: &[u16]) -> &[u16] {
+    let first_equals = usize::from(entry.first() == Some(&(b'=' as u16)));
+    let separator = entry[first_equals..]
+        .iter()
+        .position(|unit| *unit == b'=' as u16)
+        .map(|position| position + first_equals)
+        .unwrap_or(entry.len());
+    &entry[..separator]
+}
+
+#[cfg(windows)]
+fn replace_environment_entry(entries: &mut Vec<Vec<u16>>, name: &str, value: Option<&str>) {
+    entries.retain(|entry| {
+        !String::from_utf16_lossy(environment_entry_name(entry)).eq_ignore_ascii_case(name)
+    });
+    if let Some(value) = value {
+        let mut entry: Vec<u16> = name.encode_utf16().collect();
+        entry.push(b'=' as u16);
+        entry.extend(value.encode_utf16());
+        entries.push(entry);
+    }
+}
+
+#[cfg(windows)]
+fn dashboard_environment(config: &DashboardConfig) -> io::Result<Vec<u16>> {
+    let inherited = InheritedEnvironment::new()?;
+    let mut entries = inherited.entries();
+    replace_environment_entry(&mut entries, "AGENT_BROWSER_DASHBOARD", Some("1"));
+    replace_environment_entry(
+        &mut entries,
+        "AGENT_BROWSER_DASHBOARD_PORT",
+        Some(&config.port.to_string()),
+    );
+    let allowed_origins = if config.allowed_origins.is_empty() {
+        None
+    } else {
+        Some(config.allowed_origins.join(","))
+    };
+    replace_environment_entry(
+        &mut entries,
+        "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+        allowed_origins.as_deref(),
+    );
+    replace_environment_entry(
+        &mut entries,
+        "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+        config
+            .access_token
+            .as_deref()
+            .filter(|_| allowed_origins.is_some()),
+    );
+    entries.sort_by(|left, right| {
+        let left_name = environment_entry_name(left);
+        let right_name = environment_entry_name(right);
+        // SAFETY: Both slices are valid UTF-16 environment names and explicit
+        // lengths mean neither pointer needs a trailing NUL.
+        match unsafe {
+            CompareStringOrdinal(
+                left_name.as_ptr(),
+                left_name.len() as i32,
+                right_name.as_ptr(),
+                right_name.len() as i32,
+                1,
+            )
+        } {
+            CSTR_LESS_THAN => std::cmp::Ordering::Less,
+            CSTR_GREATER_THAN => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
+    let mut block = Vec::new();
+    for entry in entries {
+        block.extend(entry);
+        block.push(0);
+    }
+    block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
+    Ok(block)
+}
+
+#[cfg(windows)]
+fn wide_path(path: &std::ffi::OsStr) -> Vec<u16> {
+    path.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn quote_windows_path(path: &std::ffi::OsStr) -> Vec<u16> {
+    let units: Vec<u16> = path.encode_wide().collect();
+    let mut command_line = Vec::with_capacity(units.len() + 3);
+    command_line.push(b'"' as u16);
+    let mut backslashes = 0;
+    for unit in units {
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if unit == b'"' as u16 {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+        } else {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        }
+        command_line.push(unit);
+        backslashes = 0;
+    }
+    command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    command_line.push(b'"' as u16);
+    command_line.push(0);
+    command_line
+}
+
+#[cfg(windows)]
+fn inheritable_null_handle() -> io::Result<OwnedHandle> {
+    let mut security = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
+    };
+    let null_path = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
+    // SAFETY: The path is terminated and the attributes request inheritance.
+    let handle = unsafe {
+        CreateFileW(
+            null_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &mut security,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+        )
+    };
+    if handle as isize == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: This is a newly opened handle uniquely owned here.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as *mut c_void) })
+    }
+}
+
+#[cfg(windows)]
+fn spawn_dashboard_process(
+    exe_path: &std::path::Path,
+    config: &DashboardConfig,
+) -> io::Result<DashboardProcess> {
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    };
+
+    let application = wide_path(exe_path.as_os_str());
+    let mut command_line = quote_windows_path(exe_path.as_os_str());
+    let mut environment = dashboard_environment(config)?;
+    let stdin = inheritable_null_handle()?;
+    let stdout = inheritable_null_handle()?;
+    let stderr = inheritable_null_handle()?;
+    let handles = [
+        stdin.as_raw_handle() as HANDLE,
+        stdout.as_raw_handle() as HANDLE,
+        stderr.as_raw_handle() as HANDLE,
+    ];
+    let mut attributes = DashboardAttributeList::new(1)?;
+    attributes.allow_handles(&handles)?;
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = handles[0];
+    startup.StartupInfo.hStdOutput = handles[1];
+    startup.StartupInfo.hStdError = handles[2];
+    startup.lpAttributeList = attributes.as_ptr();
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: All strings, environment, attribute storage and allowed handles
+    // stay live through CreateProcessW. Null cwd inherits the parent's cwd.
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NEW_PROCESS_GROUP
+                | DETACHED_PROCESS,
+            environment.as_mut_ptr().cast(),
+            null(),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateProcessW returned two valid handles uniquely owned here.
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess as *mut c_void) };
+    let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as *mut c_void) };
+    drop(thread);
+    Ok(DashboardProcess {
+        id: info.dwProcessId,
+        handle: process,
+    })
+}
+
+#[cfg(not(windows))]
+fn spawn_dashboard_process(
+    exe_path: &std::path::Path,
+    config: &DashboardConfig,
+) -> std::io::Result<DashboardProcess> {
+    let mut command = Command::new(exe_path);
+    command
+        .env("AGENT_BROWSER_DASHBOARD", "1")
+        .env("AGENT_BROWSER_DASHBOARD_PORT", config.port.to_string());
+    if config.allowed_origins.is_empty() {
+        command
+            .env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
+            .env_remove("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN");
+    } else {
+        command
+            .env(
+                "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+                config.allowed_origins.join(","),
+            )
+            .env(
+                "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+                config.access_token.as_deref().expect("generated above"),
+            );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(DashboardProcess)
+}
+
 fn dashboard_config_issue(
     running: Option<&DashboardConfig>,
     requested: &DashboardConfig,
@@ -1062,53 +1484,7 @@ fn run_dashboard_start(port: u16, allowed_origins: Vec<String>, json_mode: bool)
         }
     };
 
-    let mut cmd = std::process::Command::new(&exe_path);
-    cmd.env("AGENT_BROWSER_DASHBOARD", "1").env(
-        "AGENT_BROWSER_DASHBOARD_PORT",
-        requested_config.port.to_string(),
-    );
-    if requested_config.allowed_origins.is_empty() {
-        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS");
-        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN");
-    } else {
-        cmd.env(
-            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
-            requested_config.allowed_origins.join(","),
-        )
-        .env(
-            "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
-            requested_config
-                .access_token
-                .as_deref()
-                .expect("generated above"),
-        );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-    }
-
-    match cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    match spawn_dashboard_process(&exe_path, &requested_config) {
         Ok(mut child) => {
             let pid = child.id();
             let write_result = write_dashboard_config(&requested_config)

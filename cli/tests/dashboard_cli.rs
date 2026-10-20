@@ -823,3 +823,40 @@ fn running_dashboard_rejects_configuration_changes() {
         .as_str()
         .is_some_and(|error| error.contains("dashboard stop")));
 }
+
+#[cfg(windows)]
+#[test]
+fn dashboard_start_inherits_unicode_socket_directory() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
+    let tmp = TempDir::with_prefix("dashboard-雪").unwrap();
+    let _cleanup = DashboardCleanup(&tmp);
+    let port = unused_loopback_port();
+    let port_arg = port.to_string();
+
+    let started = run_dashboard(&tmp, &["dashboard", "start", "--port", &port_arg, "--json"]);
+    assert!(
+        started.status.success(),
+        "dashboard start failed: {}",
+        dashboard_test_output(&started.stderr)
+    );
+    assert!(socket_dir(&tmp).join("dashboard.config").exists());
+    assert!(dashboard_worker_is_listening(port, Duration::from_secs(2)));
+}
+
+#[cfg(windows)]
+#[test]
+fn dashboard_start_state_write_failure_cleans_up_config_sidecar() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
+    let tmp = TempDir::new().unwrap();
+    let _cleanup = DashboardCleanup(&tmp);
+    let socket_dir = socket_dir(&tmp);
+    std::fs::create_dir_all(socket_dir.join("dashboard.pid")).unwrap();
+    let port = unused_loopback_port();
+    let port_arg = port.to_string();
+
+    let started = run_dashboard(&tmp, &["dashboard", "start", "--port", &port_arg, "--json"]);
+    assert!(!started.status.success());
+    assert_eq!(json_output(&started)["success"], false);
+    assert!(!socket_dir.join("dashboard.config").exists());
+    assert!(socket_dir.join("dashboard.pid").is_dir());
+}
