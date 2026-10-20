@@ -2809,6 +2809,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     let cmd_start = std::time::Instant::now();
 
+    #[cfg(test)]
+    let _tab_new_diagnostic = if action == "tab_new" {
+        super::tab_new_diagnostics::begin()
+    } else {
+        None
+    };
+
     if let Err(err) = validate_restore_config_from_command(cmd) {
         return error_response(&id, &err);
     }
@@ -2857,7 +2864,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     }
 
     // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
-    if let Err(e) = state.drain_cdp_events_background().await {
+    #[cfg(test)]
+    let pre_dispatch_drain_started = std::time::Instant::now();
+    let pre_dispatch_drain = state.drain_cdp_events_background().await;
+    #[cfg(test)]
+    if action == "tab_new" {
+        super::tab_new_diagnostics::mark(
+            "dispatcher.pre_event_drain",
+            pre_dispatch_drain_started,
+            pre_dispatch_drain.is_ok(),
+        );
+    }
+    if let Err(e) = pre_dispatch_drain {
         return error_response(&id, &super::browser::to_ai_friendly_error(&e));
     }
 
@@ -2918,6 +2936,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
+    #[cfg(test)]
+    let needs_launch_started = std::time::Instant::now();
     let needs_launch = if !skip_launch && !auth_login_no_navigate {
         // Check if existing connection is stale and needs re-launch.
         // This must happen before policy evaluation so plugin capability
@@ -2932,6 +2952,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     } else {
         false
     };
+    #[cfg(test)]
+    if action == "tab_new" {
+        super::tab_new_diagnostics::mark("dispatcher.needs_launch", needs_launch_started, true);
+    }
     let mut lifecycle_reused = false;
     let mut lifecycle_launched = false;
     let mut lifecycle_relaunched_browser = false;
@@ -3027,7 +3051,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if state.browser.is_some() || state.active_provider_session.is_some() {
                 let _ = auto_save_restore_state(state).await;
             }
-            if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
+            #[cfg(test)]
+            let auto_launch_started = std::time::Instant::now();
+            let auto_launch_result = auto_launch(state, plugins_from_command_or_env(cmd)).await;
+            #[cfg(test)]
+            if action == "tab_new" {
+                super::tab_new_diagnostics::mark(
+                    "dispatcher.auto_launch",
+                    auto_launch_started,
+                    auto_launch_result.is_ok(),
+                );
+            }
+            if let Err(e) = auto_launch_result {
                 let context = auto_launch_error_context(env::var("AGENT_BROWSER_CDP").is_ok());
                 return error_response(&id, &format!("{}: {}", context, e));
             }
@@ -3043,7 +3078,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     // ensure_page itself skips creation for a pinned tab_gone
                     // session, so a closed sole tab stays tab_gone instead of
                     // silently recovering onto a fresh blank page.
-                    let _ = mgr.ensure_page().await;
+                    #[cfg(test)]
+                    let ensure_page_started = std::time::Instant::now();
+                    let ensure_page_result = mgr.ensure_page().await;
+                    #[cfg(test)]
+                    if action == "tab_new" {
+                        super::tab_new_diagnostics::mark(
+                            "dispatcher.ensure_page",
+                            ensure_page_started,
+                            ensure_page_result.is_ok(),
+                        );
+                    }
+                    let _ = ensure_page_result;
                 }
             }
         }
@@ -7654,8 +7700,20 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     // UA, init scripts, headers, and routes are per-session in CDP, so when
     // any are configured the tab is created blank and navigated only after
     // they are replayed onto it; otherwise the first document would miss them.
-    let defer_url =
-        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
+    #[cfg(test)]
+    let session_setup_pending_started = std::time::Instant::now();
+    let setup_pending = if url.is_some() {
+        session_setup_pending(state).await
+    } else {
+        false
+    };
+    #[cfg(test)]
+    super::tab_new_diagnostics::mark(
+        "handle.session_setup_pending",
+        session_setup_pending_started,
+        true,
+    );
+    let defer_url = defer_url_until_controls || (url.is_some() && setup_pending);
 
     state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
@@ -7663,22 +7721,67 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.webmcp.clear_invocations();
     let (mut result, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let result = mgr
-            .tab_new(if defer_url { None } else { url }, label)
-            .await?;
+        #[cfg(test)]
+        let tab_new_started = std::time::Instant::now();
+        let tab_new_result = mgr.tab_new(if defer_url { None } else { url }, label).await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "handle.browser_manager_tab_new",
+            tab_new_started,
+            tab_new_result.is_ok(),
+        );
+        let result = tab_new_result?;
         (result, mgr.active_session_id()?.to_string())
     };
 
-    apply_session_setup(state, &new_session_id).await?;
-    install_network_controls_or_close(state, has_proxy_creds).await?;
-    state.drain_cdp_events_background().await?;
+    #[cfg(test)]
+    let setup_started = std::time::Instant::now();
+    let setup_result = apply_session_setup(state, &new_session_id).await;
+    #[cfg(test)]
+    super::tab_new_diagnostics::mark(
+        "handle.apply_session_setup",
+        setup_started,
+        setup_result.is_ok(),
+    );
+    setup_result?;
+
+    #[cfg(test)]
+    let network_controls_started = std::time::Instant::now();
+    let network_controls_result = install_network_controls_or_close(state, has_proxy_creds).await;
+    #[cfg(test)]
+    super::tab_new_diagnostics::mark(
+        "handle.install_network_controls",
+        network_controls_started,
+        network_controls_result.is_ok(),
+    );
+    network_controls_result?;
+
+    #[cfg(test)]
+    let post_tab_new_drain_started = std::time::Instant::now();
+    let post_tab_new_drain = state.drain_cdp_events_background().await;
+    #[cfg(test)]
+    super::tab_new_diagnostics::mark(
+        "handle.post_tab_new_event_drain",
+        post_tab_new_drain_started,
+        post_tab_new_drain.is_ok(),
+    );
+    post_tab_new_drain?;
 
     if defer_url {
         if let Some(url) = url {
-            let nav = {
+            #[cfg(test)]
+            let navigate_started = std::time::Instant::now();
+            let navigate_result = {
                 let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-                mgr.navigate(url, WaitUntil::Load).await?
+                mgr.navigate(url, WaitUntil::Load).await
             };
+            #[cfg(test)]
+            super::tab_new_diagnostics::mark(
+                "handle.deferred_navigation",
+                navigate_started,
+                navigate_result.is_ok(),
+            );
+            let nav = navigate_result?;
             if let Some(obj) = result.as_object_mut() {
                 if let Some(value) = nav.get("url") {
                     obj.insert("url".to_string(), value.clone());
@@ -7690,7 +7793,15 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         }
     }
 
+    #[cfg(test)]
+    let refresh_iframes_started = std::time::Instant::now();
     state.refresh_active_iframe_sessions().await;
+    #[cfg(test)]
+    super::tab_new_diagnostics::mark(
+        "handle.refresh_iframe_sessions",
+        refresh_iframes_started,
+        true,
+    );
 
     Ok(result)
 }

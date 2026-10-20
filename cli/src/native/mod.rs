@@ -53,3 +53,5 @@ pub mod webmcp;
 mod e2e_tests;
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+pub(crate) mod tab_new_diagnostics;

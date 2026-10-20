@@ -837,31 +837,95 @@ impl BrowserManager {
     }
 
     async fn enable_domains(&self, session_id: &str) -> Result<(), String> {
-        self.prepare_domains(session_id).await?;
-        self.resume_if_waiting(session_id).await?;
+        #[cfg(test)]
+        let prepare_started = Instant::now();
+        let prepare_result = self.prepare_domains(session_id).await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.prepare_domains",
+            prepare_started,
+            prepare_result.is_ok(),
+        );
+        prepare_result?;
+
+        #[cfg(test)]
+        let resume_started = Instant::now();
+        let resume_result = self.resume_if_waiting(session_id).await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.resume_if_waiting",
+            resume_started,
+            resume_result.is_ok(),
+        );
+        resume_result?;
         Ok(())
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
-        self.client
+        #[cfg(test)]
+        let page_enable_started = Instant::now();
+        let page_enable_result = self
+            .client
             .send_command_no_params("Page.enable", Some(session_id))
-            .await?;
-        self.client
+            .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Page.enable",
+            page_enable_started,
+            page_enable_result.is_ok(),
+        );
+        page_enable_result?;
+
+        #[cfg(test)]
+        let runtime_enable_started = Instant::now();
+        let runtime_enable_result = self
+            .client
             .send_command_no_params("Runtime.enable", Some(session_id))
-            .await?;
-        self.client
+            .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Runtime.enable",
+            runtime_enable_started,
+            runtime_enable_result.is_ok(),
+        );
+        runtime_enable_result?;
+
+        #[cfg(test)]
+        let network_enable_started = Instant::now();
+        let network_enable_result = self
+            .client
             .send_command_no_params("Network.enable", Some(session_id))
-            .await?;
-        let _ = self
+            .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Network.enable",
+            network_enable_started,
+            network_enable_result.is_ok(),
+        );
+        network_enable_result?;
+
+        #[cfg(test)]
+        let webmcp_enable_started = Instant::now();
+        let webmcp_enable_result = self
             .client
             .send_command_no_params("WebMCP.enable", Some(session_id))
             .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.WebMCP.enable",
+            webmcp_enable_started,
+            webmcp_enable_result.is_ok(),
+        );
+        #[cfg(not(test))]
+        let _ = webmcp_enable_result;
         // Enable auto-attach for cross-origin iframe support.
         // flatten: true gives each iframe its own session_id.
         // waitForDebuggerOnStart keeps child targets paused until the daemon
         // installs any required network controls and explicitly resumes them.
         // Ignored on engines that don't support it (e.g. Lightpanda).
-        let _ = self
+        #[cfg(test)]
+        let auto_attach_started = Instant::now();
+        let auto_attach_result = self
             .client
             .send_command(
                 "Target.setAutoAttach",
@@ -873,6 +937,14 @@ impl BrowserManager {
                 Some(session_id),
             )
             .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Target.setAutoAttach",
+            auto_attach_started,
+            auto_attach_result.is_ok(),
+        );
+        #[cfg(not(test))]
+        let _ = auto_attach_result;
         Ok(())
     }
 
@@ -1637,7 +1709,9 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
+        #[cfg(test)]
+        let create_target_started = Instant::now();
+        let create_target_result = self
             .client
             .send_command_typed(
                 "Target.createTarget",
@@ -1646,9 +1720,18 @@ impl BrowserManager {
                 },
                 None,
             )
-            .await?;
+            .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Target.createTarget",
+            create_target_started,
+            create_target_result.is_ok(),
+        );
+        let result: CreateTargetResult = create_target_result?;
 
-        let attach: AttachToTargetResult = self
+        #[cfg(test)]
+        let attach_target_started = Instant::now();
+        let attach_target_result = self
             .client
             .send_command_typed(
                 "Target.attachToTarget",
@@ -1658,9 +1741,25 @@ impl BrowserManager {
                 },
                 None,
             )
-            .await?;
+            .await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "cdp.Target.attachToTarget",
+            attach_target_started,
+            attach_target_result.is_ok(),
+        );
+        let attach: AttachToTargetResult = attach_target_result?;
 
-        self.enable_domains(&attach.session_id).await?;
+        #[cfg(test)]
+        let enable_domains_started = Instant::now();
+        let enable_domains_result = self.enable_domains(&attach.session_id).await;
+        #[cfg(test)]
+        super::tab_new_diagnostics::mark(
+            "browser.enable_domains",
+            enable_domains_started,
+            enable_domains_result.is_ok(),
+        );
+        enable_domains_result?;
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
