@@ -1718,41 +1718,48 @@ impl BrowserManager {
         );
         #[cfg(test)]
         if let Err(error) = &enable_result {
+            const MAX_TARGET_EVENT_PROBE_READS: usize = 1_024;
             let mut attached_event_matched = false;
             let mut waiting_for_debugger = None;
             let mut destroyed_event_matched = false;
             let mut detached_event_matched = false;
+            let mut event_probe_reads = 0;
+            let mut events_examined = 0;
             let mut skipped_events = 0_u64;
-            loop {
+            while event_probe_reads < MAX_TARGET_EVENT_PROBE_READS {
+                event_probe_reads += 1;
                 match target_events.try_recv() {
-                    Ok(event) => match event.method.as_str() {
-                        "Target.attachedToTarget" => {
-                            let matches_target = event
-                                .params
-                                .get("targetInfo")
-                                .and_then(|info| info.get("targetId"))
-                                .and_then(Value::as_str)
-                                == Some(result.target_id.as_str());
-                            if matches_target {
-                                attached_event_matched = true;
-                                waiting_for_debugger = event
+                    Ok(event) => {
+                        events_examined += 1;
+                        match event.method.as_str() {
+                            "Target.attachedToTarget" => {
+                                let matches_target = event
                                     .params
-                                    .get("waitingForDebugger")
-                                    .and_then(Value::as_bool);
-                            }
-                        }
-                        "Target.targetDestroyed" => {
-                            destroyed_event_matched |=
-                                event.params.get("targetId").and_then(Value::as_str)
+                                    .get("targetInfo")
+                                    .and_then(|info| info.get("targetId"))
+                                    .and_then(Value::as_str)
                                     == Some(result.target_id.as_str());
+                                if matches_target {
+                                    attached_event_matched = true;
+                                    waiting_for_debugger = event
+                                        .params
+                                        .get("waitingForDebugger")
+                                        .and_then(Value::as_bool);
+                                }
+                            }
+                            "Target.targetDestroyed" => {
+                                destroyed_event_matched |=
+                                    event.params.get("targetId").and_then(Value::as_str)
+                                        == Some(result.target_id.as_str());
+                            }
+                            "Target.detachedFromTarget" => {
+                                detached_event_matched |=
+                                    event.params.get("sessionId").and_then(Value::as_str)
+                                        == Some(attach.session_id.as_str());
+                            }
+                            _ => {}
                         }
-                        "Target.detachedFromTarget" => {
-                            detached_event_matched |=
-                                event.params.get("sessionId").and_then(Value::as_str)
-                                    == Some(attach.session_id.as_str());
-                        }
-                        _ => {}
-                    },
+                    }
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                         skipped_events = skipped_events.saturating_add(skipped);
                     }
@@ -1815,13 +1822,15 @@ impl BrowserManager {
                 "other_error"
             };
             eprintln!(
-                "TAB_NEW_FAILURE_DIAG error_class={} matched_attach_event={} waiting_for_debugger={} matched_destroyed_event={} matched_detached_event={} skipped_events={} browser_health={} target_health={} target_type={} target_attached={} browser_process_exited={} stderr_pending_bytes={}",
+                "TAB_NEW_FAILURE_DIAG error_class={} matched_attach_event={} waiting_for_debugger={} matched_destroyed_event={} matched_detached_event={} events_examined={} skipped_events={} events_truncated={} browser_health={} target_health={} target_type={} target_attached={} browser_process_exited={} stderr_pending_bytes={}",
                 error_class,
                 attached_event_matched,
                 waiting_for_debugger.map_or("unknown", |waiting| if waiting { "true" } else { "false" }),
                 destroyed_event_matched,
                 detached_event_matched,
+                events_examined,
                 skipped_events,
+                event_probe_reads == MAX_TARGET_EVENT_PROBE_READS,
                 browser_health,
                 target_health,
                 target_type,
