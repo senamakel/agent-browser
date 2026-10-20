@@ -206,6 +206,59 @@ jobs:
           path: cli/target/dashboard-cli-diagnostic.log
           if-no-files-found: ignore
 
+  windows-tabnew-regressions:
+    name: Windows tab_new regressions
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Install Chrome
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          New-Item -ItemType Directory -Force -Path cli/target | Out-Null
+          cargo run --profile ci --locked --manifest-path cli/Cargo.toml -- install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run action parity regression
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --lib test_all_documented_actions_are_handled -- --nocapture 2>&1 | Tee-Object -FilePath cli/target/windows-tabnew-parity.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path cli/target/windows-tabnew-parity.log -Pattern '^running 1 test$' -Quiet)) { throw "The action parity filter did not run exactly one test." }
+
+      - name: Run ignored active-controls E2E regression
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --lib e2e_tab_new_applies_network_controls_before_first_navigation -- --ignored --nocapture 2>&1 | Tee-Object -FilePath cli/target/windows-tabnew-active-controls.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path cli/target/windows-tabnew-active-controls.log -Pattern '^running 1 test$' -Quiet)) { throw "The active-controls E2E filter did not run exactly one test." }
+
+      - name: Preserve tab_new regression output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-tabnew-regressions
+          path: cli/target/windows-tabnew-*.log
+          if-no-files-found: ignore
+
   native-e2e:
     name: Native E2E Tests
     if: github.event_name != 'pull_request'
