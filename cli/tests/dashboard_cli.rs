@@ -1,6 +1,7 @@
 //! Integration tests for the standalone dashboard lifecycle.
 
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -21,11 +22,46 @@ const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 static NEXT_DASHBOARD_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    static DASHBOARD_DIAGNOSTIC_INCOMPLETE: Cell<bool> = const { Cell::new(false) };
+    static DASHBOARD_DIAGNOSTIC_PENDING_PIPES: RefCell<Vec<PendingDashboardPipe>> = const { RefCell::new(Vec::new()) };
+}
+
+struct PendingDashboardPipe {
+    invocation: u64,
+    operation: &'static str,
+    stream: &'static str,
+    receiver: Receiver<std::io::Result<Vec<u8>>>,
+}
+
+struct DashboardDiagnosticCheck;
+
+impl DashboardDiagnosticCheck {
+    fn new() -> Self {
+        if dashboard_diagnostics_enabled() {
+            DASHBOARD_DIAGNOSTIC_INCOMPLETE.with(|incomplete| incomplete.set(false));
+        }
+        Self
+    }
+}
+
+impl Drop for DashboardDiagnosticCheck {
+    fn drop(&mut self) {
+        if dashboard_diagnostics_enabled() && !thread::panicking() {
+            let incomplete = DASHBOARD_DIAGNOSTIC_INCOMPLETE.with(Cell::get);
+            assert!(!incomplete, "dashboard diagnostic capture was incomplete");
+        }
+    }
+}
+
 struct DashboardCleanup<'a>(&'a TempDir);
 
 impl Drop for DashboardCleanup<'_> {
     fn drop(&mut self) {
         let _ = run_dashboard(self.0, &["dashboard", "stop", "--json"]);
+        if dashboard_diagnostics_enabled() {
+            observe_pending_pipes_after_worker_stop();
+        }
     }
 }
 
@@ -35,6 +71,9 @@ impl Drop for RunningDashboard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        if dashboard_diagnostics_enabled() {
+            observe_pending_pipes_after_worker_stop();
+        }
     }
 }
 
@@ -275,12 +314,82 @@ fn read_pipe_to_channel<R: Read + Send + 'static>(
     });
 }
 
+fn retain_pending_pipe(
+    receiver: Receiver<std::io::Result<Vec<u8>>>,
+    invocation: u64,
+    operation: &'static str,
+    stream: &'static str,
+) {
+    DASHBOARD_DIAGNOSTIC_PENDING_PIPES.with(|pending| {
+        pending.borrow_mut().push(PendingDashboardPipe {
+            invocation,
+            operation,
+            stream,
+            receiver,
+        });
+    });
+}
+
+fn observe_pending_pipes_after_worker_stop() {
+    let pending = DASHBOARD_DIAGNOSTIC_PENDING_PIPES
+        .with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    for pipe in pending {
+        let started = Instant::now();
+        match pipe.receiver.recv_timeout(PIPE_EOF_TIMEOUT) {
+            Ok(Ok(bytes)) => dashboard_diagnostic_marker(
+                pipe.invocation,
+                pipe.operation,
+                match pipe.stream {
+                    "stdout" => "stdout_eof_after_worker_stop",
+                    _ => "stderr_eof_after_worker_stop",
+                },
+                started,
+                "eof",
+                &format!("bytes={}", bytes.len()),
+            ),
+            Ok(Err(_)) => dashboard_diagnostic_marker(
+                pipe.invocation,
+                pipe.operation,
+                match pipe.stream {
+                    "stdout" => "stdout_eof_after_worker_stop",
+                    _ => "stderr_eof_after_worker_stop",
+                },
+                started,
+                "read_error",
+                "bytes=0",
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => dashboard_diagnostic_marker(
+                pipe.invocation,
+                pipe.operation,
+                match pipe.stream {
+                    "stdout" => "stdout_eof_after_worker_stop",
+                    _ => "stderr_eof_after_worker_stop",
+                },
+                started,
+                "timeout",
+                "bytes=0",
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => dashboard_diagnostic_marker(
+                pipe.invocation,
+                pipe.operation,
+                match pipe.stream {
+                    "stdout" => "stdout_eof_after_worker_stop",
+                    _ => "stderr_eof_after_worker_stop",
+                },
+                started,
+                "disconnected",
+                "bytes=0",
+            ),
+        }
+    }
+}
+
 fn collect_diagnostic_pipe(
     receiver: Receiver<std::io::Result<Vec<u8>>>,
     invocation: u64,
-    operation: &str,
-    name: &str,
-) -> Vec<u8> {
+    operation: &'static str,
+    name: &'static str,
+) -> (Vec<u8>, bool) {
     let started = Instant::now();
     match receiver.recv_timeout(PIPE_EOF_TIMEOUT) {
         Ok(Ok(bytes)) => {
@@ -292,7 +401,7 @@ fn collect_diagnostic_pipe(
                 "eof",
                 &format!("bytes={}", bytes.len()),
             );
-            bytes
+            (bytes, true)
         }
         Ok(Err(_)) => {
             dashboard_diagnostic_marker(
@@ -303,11 +412,17 @@ fn collect_diagnostic_pipe(
                 "read_error",
                 "bytes=0",
             );
-            Vec::new()
+            (Vec::new(), false)
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             dashboard_diagnostic_marker(invocation, operation, name, started, "timeout", "bytes=0");
-            Vec::new()
+            retain_pending_pipe(
+                receiver,
+                invocation,
+                operation,
+                name.strip_suffix("_eof").unwrap_or(name),
+            );
+            (Vec::new(), false)
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             dashboard_diagnostic_marker(
@@ -318,8 +433,21 @@ fn collect_diagnostic_pipe(
                 "disconnected",
                 "bytes=0",
             );
-            Vec::new()
+            (Vec::new(), false)
         }
+    }
+}
+
+fn unsuccessful_diagnostic_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1 << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1)
     }
 }
 
@@ -331,6 +459,8 @@ fn run_dashboard_with_diagnostics(
     let invocation = NEXT_DASHBOARD_DIAGNOSTIC_ID.fetch_add(1, Ordering::SeqCst);
     let operation = dashboard_operation(args);
     let port = dashboard_probe_port(operation, args, socket_dir);
+    let sidecars_before =
+        socket_dir.join("dashboard.pid").exists() && socket_dir.join("dashboard.config").exists();
     let spawn_started = Instant::now();
     eprintln!(
         "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=launcher_spawn_begin elapsed_ms=0 outcome=started"
@@ -361,7 +491,25 @@ fn run_dashboard_with_diagnostics(
                 "error",
                 "",
             );
-            panic!("dashboard diagnostic launcher spawn failed");
+            let sidecars_present = socket_dir.join("dashboard.pid").exists()
+                && socket_dir.join("dashboard.config").exists();
+            eprintln!(
+                "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_sidecars elapsed_ms=0 outcome=checked before={} after={} details=content_omitted",
+                if sidecars_before { "present" } else { "absent" },
+                if sidecars_present { "present" } else { "absent" },
+            );
+            eprintln!(
+                "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_worker_listener elapsed_ms=0 outcome=skipped reason=launcher_spawn_failed"
+            );
+            eprintln!(
+                "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=capture_complete elapsed_ms=0 outcome=incomplete"
+            );
+            DASHBOARD_DIAGNOSTIC_INCOMPLETE.with(|incomplete| incomplete.set(true));
+            return Output {
+                status: unsuccessful_diagnostic_status(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
         }
     };
 
@@ -410,16 +558,23 @@ fn run_dashboard_with_diagnostics(
         &format!("exit_status={exit_status}"),
     );
 
-    let stdout = collect_diagnostic_pipe(stdout_receiver, invocation, operation, "stdout_eof");
-    let stderr = collect_diagnostic_pipe(stderr_receiver, invocation, operation, "stderr_eof");
+    let (stdout, stdout_complete) =
+        collect_diagnostic_pipe(stdout_receiver, invocation, operation, "stdout_eof");
+    let (stderr, stderr_complete) =
+        collect_diagnostic_pipe(stderr_receiver, invocation, operation, "stderr_eof");
 
     let sidecars_present =
         socket_dir.join("dashboard.pid").exists() && socket_dir.join("dashboard.config").exists();
     eprintln!(
-        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_sidecars elapsed_ms=0 outcome={} details=content_omitted",
-        if sidecars_present { "present" } else { "absent" }
+        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_sidecars elapsed_ms=0 outcome=checked before={} after={} details=content_omitted",
+        if sidecars_before { "present" } else { "absent" },
+        if sidecars_present { "present" } else { "absent" },
     );
-    if let Some(port) = port.filter(|_| status.success()) {
+    let should_probe_worker = operation == "stop"
+        || (operation == "start"
+            && !sidecars_before
+            && (status.success() || sidecars_present || launcher_timed_out));
+    if let Some(port) = port.filter(|_| should_probe_worker) {
         let worker_probe_started = Instant::now();
         let listening = dashboard_worker_is_listening(port, WORKER_PROBE_TIMEOUT);
         dashboard_diagnostic_marker(
@@ -434,7 +589,30 @@ fn run_dashboard_with_diagnostics(
             },
             "address_omitted",
         );
+    } else {
+        eprintln!(
+            "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=dashboard_worker_listener elapsed_ms=0 outcome=skipped reason={}",
+            if sidecars_before {
+                "preexisting_dashboard"
+            } else {
+                "no_verified_start"
+            }
+        );
     }
+
+    let diagnostic_complete = !launcher_timed_out && stdout_complete && stderr_complete;
+    eprintln!(
+        "DASHBOARD_DIAG invocation={invocation} operation={operation} stage=capture_complete elapsed_ms=0 outcome={}",
+        if diagnostic_complete { "complete" } else { "incomplete" }
+    );
+    if !diagnostic_complete {
+        DASHBOARD_DIAGNOSTIC_INCOMPLETE.with(|incomplete| incomplete.set(true));
+    }
+    let status = if diagnostic_complete || !status.success() {
+        status
+    } else {
+        unsuccessful_diagnostic_status()
+    };
 
     Output {
         status,
@@ -455,6 +633,7 @@ fn json_output(output: &Output) -> Value {
 
 #[test]
 fn explicit_dashboard_start_accepts_mcp_style_arguments() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
     let tmp = TempDir::new().unwrap();
     let _cleanup = DashboardCleanup(&tmp);
     let port = unused_loopback_port();
@@ -506,6 +685,7 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
 
 #[test]
 fn dashboard_listens_on_and_authorizes_ipv6_loopback() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
     // Some minimal CI/container kernels disable IPv6 entirely. In that case
     // the production server deliberately remains available on IPv4 only.
     if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
@@ -534,6 +714,7 @@ fn dashboard_listens_on_and_authorizes_ipv6_loopback() {
 
 #[test]
 fn invalid_dashboard_options_fail_without_starting_a_server() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
     let cases: &[&[&str]] = &[
         &["dashboard", "--bogus", "--json"],
         &[
@@ -570,6 +751,7 @@ fn invalid_dashboard_options_fail_without_starting_a_server() {
 
 #[test]
 fn running_dashboard_rejects_configuration_changes() {
+    let _diagnostic_check = DashboardDiagnosticCheck::new();
     let tmp = TempDir::new().unwrap();
     let port = unused_loopback_port();
     let _dashboard = seed_running_dashboard(
