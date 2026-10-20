@@ -444,6 +444,19 @@ async fn test_all_documented_actions_are_handled() {
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
         let id = format!("parity-{}", i);
         let cmd = minimal_command(action, &id, &base_url);
+        #[cfg(test)]
+        if *action == "window_new" {
+            let browser = state.browser.as_ref();
+            eprintln!(
+                "PARITY_WINDOW_NEW_CONTEXT action_index={} browser_present={} browser_owned={} tracked_pages={} active_session_present={} default_timeout_ms={} profile_mode=default_ephemeral",
+                i,
+                browser.is_some(),
+                browser.is_some_and(|manager| !manager.is_cdp_connection()),
+                browser.map_or(0, |manager| manager.page_count()),
+                browser.is_some_and(|manager| manager.active_session_id().is_ok()),
+                state.default_timeout_ms
+            );
+        }
         // Generous: `launch` starts a real browser, and the slowest CI target
         // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
         let result = tokio::time::timeout(
