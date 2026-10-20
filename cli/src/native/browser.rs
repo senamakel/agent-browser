@@ -13,6 +13,29 @@ use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
 use super::tab_binding;
 
+#[cfg(test)]
+macro_rules! trace_test_browser_stage {
+    ($stage:literal, $future:expr $(,)?) => {{
+        let started = Instant::now();
+        eprintln!("BROWSER_TAB_NEW_DIAG stage={} state=begin", $stage);
+        let result = $future.await;
+        eprintln!(
+            "BROWSER_TAB_NEW_DIAG stage={} state=complete elapsed_ms={} outcome={}",
+            $stage,
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_test_browser_stage {
+    ($stage:literal, $future:expr $(,)?) => {
+        $future.await
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Launch validation
 // ---------------------------------------------------------------------------
@@ -843,27 +866,34 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
-        self.client
-            .send_command_no_params("Page.enable", Some(session_id))
-            .await?;
-        self.client
-            .send_command_no_params("Runtime.enable", Some(session_id))
-            .await?;
-        self.client
-            .send_command_no_params("Network.enable", Some(session_id))
-            .await?;
-        let _ = self
-            .client
-            .send_command_no_params("WebMCP.enable", Some(session_id))
-            .await;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.page_enable",
+            self.client
+                .send_command_no_params("Page.enable", Some(session_id))
+        )?;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.runtime_enable",
+            self.client
+                .send_command_no_params("Runtime.enable", Some(session_id))
+        )?;
+        trace_test_browser_stage!(
+            "browser.prepare_domains.network_enable",
+            self.client
+                .send_command_no_params("Network.enable", Some(session_id))
+        )?;
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.webmcp_enable",
+            self.client
+                .send_command_no_params("WebMCP.enable", Some(session_id))
+        );
         // Enable auto-attach for cross-origin iframe support.
         // flatten: true gives each iframe its own session_id.
         // waitForDebuggerOnStart keeps child targets paused until the daemon
         // installs any required network controls and explicitly resumes them.
         // Ignored on engines that don't support it (e.g. Lightpanda).
-        let _ = self
-            .client
-            .send_command(
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.target_auto_attach",
+            self.client.send_command(
                 "Target.setAutoAttach",
                 Some(json!({
                     "autoAttach": true,
@@ -872,7 +902,7 @@ impl BrowserManager {
                 })),
                 Some(session_id),
             )
-            .await;
+        );
         Ok(())
     }
 
@@ -985,10 +1015,14 @@ impl BrowserManager {
     async fn resume_if_waiting(&self, session_id: &str) -> Result<(), String> {
         // Needed for real browser sessions (Chrome 144+) where targets are
         // paused after attach until explicitly resumed. No-op otherwise.
-        let _ = self
-            .client
-            .send_command_no_wait("Runtime.runIfWaitingForDebugger", None, Some(session_id))
-            .await;
+        let _ = trace_test_browser_stage!(
+            "browser.prepare_domains.resume_if_waiting",
+            self.client.send_command_no_wait(
+                "Runtime.runIfWaitingForDebugger",
+                None,
+                Some(session_id)
+            )
+        );
         Ok(())
     }
 
@@ -1637,30 +1671,33 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
+        let result: CreateTargetResult = trace_test_browser_stage!(
+            "browser.tab_new.create_target",
+            self.client.send_command_typed(
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
                 },
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
+        let attach: AttachToTargetResult = trace_test_browser_stage!(
+            "browser.tab_new.attach_target",
+            self.client.send_command_typed(
                 "Target.attachToTarget",
                 &AttachToTargetParams {
                     target_id: result.target_id.clone(),
                     flatten: true,
                 },
                 None,
-            )
-            .await?;
+            ),
+        )?;
 
-        self.enable_domains(&attach.session_id).await?;
+        trace_test_browser_stage!(
+            "browser.tab_new.enable_domains",
+            self.enable_domains(&attach.session_id)
+        )?;
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;

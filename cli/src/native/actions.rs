@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
@@ -43,6 +45,29 @@ use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
 use super::webdriver::ios;
+
+#[cfg(test)]
+macro_rules! trace_test_action_stage {
+    ($stage:literal, $future:expr $(,)?) => {{
+        let started = Instant::now();
+        eprintln!("TAB_NEW_ACTION_DIAG stage={} state=begin", $stage);
+        let result = $future.await;
+        eprintln!(
+            "TAB_NEW_ACTION_DIAG stage={} state=complete elapsed_ms={} outcome={}",
+            $stage,
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! trace_test_action_stage {
+    ($stage:literal, $future:expr $(,)?) => {
+        $future.await
+    };
+}
 use super::webdriver::safari;
 use super::webmcp;
 
@@ -1861,6 +1886,24 @@ impl DaemonState {
                             continue;
                         }
                         "Target.attachedToTarget" => {
+                            #[cfg(test)]
+                            {
+                                let target_type = event
+                                    .params
+                                    .get("targetInfo")
+                                    .and_then(|value| value.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                let waiting_for_debugger = event
+                                    .params
+                                    .get("waitingForDebugger")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                eprintln!(
+                                    "CDP_ATTACH_DIAG target_type={} waiting_for_debugger={}",
+                                    target_type, waiting_for_debugger
+                                );
+                            }
                             if let (Some(sid), Some(target_info_value)) = (
                                 event.params.get("sessionId").and_then(|v| v.as_str()),
                                 event.params.get("targetInfo"),
@@ -7704,8 +7747,25 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     // UA, init scripts, headers, and routes are per-session in CDP, so when
     // any are configured the tab is created blank and navigated only after
     // they are replayed onto it; otherwise the first document would miss them.
-    let defer_url =
-        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
+    let pending_session_setup = if !defer_url_until_controls && url.is_some() {
+        Some(session_setup_pending(state).await)
+    } else {
+        None
+    };
+    let defer_url = defer_url_until_controls || pending_session_setup.unwrap_or(false);
+    #[cfg(test)]
+    eprintln!(
+        "TAB_NEW_ACTION_DIAG context url_present={} domain_filter_present={} domain_count={} proxy_credentials_present={} browser_auto_attach_installed={} defer_url_until_controls={} session_setup_checked={} session_setup_pending={} defer_url={}",
+        url.is_some(),
+        domain_filter.is_some(),
+        domain_filter.as_ref().map_or(0, |filter| filter.allowed_domains.len()),
+        has_proxy_creds,
+        state.network_auto_attach_installed,
+        defer_url_until_controls,
+        pending_session_setup.is_some(),
+        pending_session_setup.unwrap_or(false),
+        defer_url
+    );
 
     state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
@@ -7713,22 +7773,35 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.webmcp.clear_invocations();
     let (mut result, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let result = mgr
-            .tab_new(if defer_url { None } else { url }, label)
-            .await?;
+        let result = trace_test_action_stage!(
+            "handle_tab_new.browser_tab_new",
+            mgr.tab_new(if defer_url { None } else { url }, label)
+        )?;
         (result, mgr.active_session_id()?.to_string())
     };
 
-    apply_session_setup(state, &new_session_id).await?;
-    install_network_controls_or_close(state, has_proxy_creds).await?;
-    state.drain_cdp_events_background().await?;
+    trace_test_action_stage!(
+        "handle_tab_new.apply_session_setup",
+        apply_session_setup(state, &new_session_id)
+    )?;
+    trace_test_action_stage!(
+        "handle_tab_new.install_network_controls",
+        install_network_controls_or_close(state, has_proxy_creds)
+    )?;
+    trace_test_action_stage!(
+        "handle_tab_new.drain_cdp_events",
+        state.drain_cdp_events_background()
+    )?;
 
     if defer_url {
         if let Some(url) = url {
-            let nav = {
-                let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-                mgr.navigate(url, WaitUntil::Load).await?
-            };
+            let nav = trace_test_action_stage!("handle_tab_new.navigate", async {
+                let mgr = state
+                    .browser
+                    .as_mut()
+                    .ok_or_else(|| "Browser not launched".to_string())?;
+                mgr.navigate(url, WaitUntil::Load).await
+            })?;
             if let Some(obj) = result.as_object_mut() {
                 if let Some(value) = nav.get("url") {
                     obj.insert("url".to_string(), value.clone());

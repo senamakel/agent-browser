@@ -12,6 +12,47 @@ use super::actions::{execute_command, DaemonState};
 
 const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
 
+const PARITY_TEST_ENV: &[&str] = &[
+    "AGENT_BROWSER_SESSION",
+    "AGENT_BROWSER_SESSION_NAME",
+    "AGENT_BROWSER_NAMESPACE",
+    "AGENT_BROWSER_SOCKET_DIR",
+    "AGENT_BROWSER_PIN_TAB",
+    "AGENT_BROWSER_ALLOWED_DOMAINS",
+    "AGENT_BROWSER_NO_AUTO_DIALOG",
+    "AGENT_BROWSER_ENGINE",
+    "AGENT_BROWSER_DEFAULT_TIMEOUT",
+    "AGENT_BROWSER_CONFIRM_ACTIONS",
+    "AGENT_BROWSER_ACTION_POLICY",
+    "AGENT_BROWSER_POLICY",
+    "AGENT_BROWSER_RESTORE_SAVE",
+    "AGENT_BROWSER_RESTORE_CHECK_URL",
+    "AGENT_BROWSER_RESTORE_CHECK_TEXT",
+    "AGENT_BROWSER_RESTORE_CHECK_FN",
+    "AGENT_BROWSER_PROVIDER",
+    "AGENT_BROWSER_CDP",
+    "AGENT_BROWSER_AUTO_CONNECT",
+    "AGENT_BROWSER_ENABLE",
+    "AGENT_BROWSER_INIT_SCRIPTS",
+    "AGENT_BROWSER_EXTENSIONS",
+    "AGENT_BROWSER_PROXY",
+    "AGENT_BROWSER_PROXY_BYPASS",
+    "AGENT_BROWSER_PROXY_USERNAME",
+    "AGENT_BROWSER_PROXY_PASSWORD",
+    "AGENT_BROWSER_PROFILE",
+    "AGENT_BROWSER_ALLOW_FILE_ACCESS",
+    "AGENT_BROWSER_STATE",
+    "AGENT_BROWSER_USER_AGENT",
+    "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+    "AGENT_BROWSER_COLOR_SCHEME",
+    "AGENT_BROWSER_DOWNLOAD_PATH",
+    "AGENT_BROWSER_HIDE_SCROLLBARS",
+    "AGENT_BROWSER_WEBGPU",
+    "AGENT_BROWSER_NO_WEBMCP",
+    "AGENT_BROWSER_NO_XVFB",
+    "AGENT_BROWSER_PLUGINS",
+];
+
 struct TestKeyGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     original: Option<String>,
@@ -437,6 +478,21 @@ async fn spawn_parity_http_fixture() -> (String, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn test_all_documented_actions_are_handled() {
+    let env_guard = crate::test_utils::EnvGuard::new(PARITY_TEST_ENV);
+    let socket_dir = tempfile::tempdir().unwrap();
+    for name in PARITY_TEST_ENV {
+        env_guard.remove(name);
+    }
+    env_guard.set("AGENT_BROWSER_SESSION", "documented-actions-parity");
+    env_guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir
+            .path()
+            .to_str()
+            .expect("test socket path is UTF-8"),
+    );
+    let _key_guard = TestKeyGuard::new();
+
     let mut state = DaemonState::new();
     state.default_timeout_ms = 100;
     let (base_url, fixture_server) = spawn_parity_http_fixture().await;
@@ -445,10 +501,11 @@ async fn test_all_documented_actions_are_handled() {
         let id = format!("parity-{}", i);
         let cmd = minimal_command(action, &id, &base_url);
         #[cfg(test)]
-        if *action == "window_new" {
+        if *action == "tab_new" || *action == "window_new" {
             let browser = state.browser.as_ref();
             eprintln!(
-                "PARITY_WINDOW_NEW_CONTEXT action_index={} browser_present={} browser_owned={} tracked_pages={} active_session_present={} default_timeout_ms={} profile_mode=default_ephemeral",
+                "PARITY_BROWSER_ACTION_CONTEXT action={} action_index={} browser_present={} browser_owned={} tracked_pages={} active_session_present={} default_timeout_ms={} profile_mode=default_ephemeral",
+                action,
                 i,
                 browser.is_some(),
                 browser.is_some_and(|manager| !manager.is_cdp_connection()),
@@ -456,6 +513,30 @@ async fn test_all_documented_actions_are_handled() {
                 browser.is_some_and(|manager| manager.active_session_id().is_ok()),
                 state.default_timeout_ms
             );
+            if *action == "tab_new" {
+                let (domain_filter_present, domain_count) = {
+                    let filter = state.domain_filter.read().await;
+                    (
+                        filter.is_some(),
+                        filter
+                            .as_ref()
+                            .map_or(0, |value| value.allowed_domains.len()),
+                    )
+                };
+                let proxy_credentials_present = state.proxy_credentials.read().await.is_some();
+                eprintln!(
+                    "PARITY_TAB_NEW_CONTEXT domain_filter_present={} domain_count={} proxy_credentials_present={} executable_selection={} launch_args_present={}",
+                    domain_filter_present,
+                    domain_count,
+                    proxy_credentials_present,
+                    if std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH").is_some() {
+                        "explicit_env"
+                    } else {
+                        "path_resolution"
+                    },
+                    std::env::var_os("AGENT_BROWSER_ARGS").is_some()
+                );
+            }
         }
         // Generous: `launch` starts a real browser, and the slowest CI target
         // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
@@ -473,6 +554,42 @@ async fn test_all_documented_actions_are_handled() {
         );
 
         let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+
+        #[cfg(test)]
+        if *action == "launch" && result.get("success").and_then(Value::as_bool) == Some(true) {
+            let browser_version = if let Some(manager) = state.browser.as_ref() {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    manager
+                        .client
+                        .send_command_no_params("Browser.getVersion", None),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            } else {
+                None
+            };
+            let product = browser_version
+                .as_ref()
+                .and_then(|version| version.get("product"))
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            let (browser_name, full_version) = product.split_once('/').unwrap_or((product, ""));
+            let major = full_version.split('.').next().unwrap_or("unknown");
+            eprintln!(
+                "PARITY_BROWSER_LAUNCH engine={} browser_name={} browser_major={} browser_version_available={} selection_source={}",
+                state.engine.as_str(),
+                browser_name,
+                major,
+                browser_version.is_some(),
+                if std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH").is_some() {
+                    "explicit_env"
+                } else {
+                    "path_resolution"
+                }
+            );
+        }
 
         assert!(
             !error.contains("Not yet implemented"),

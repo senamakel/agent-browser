@@ -142,6 +142,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -257,6 +258,44 @@ jobs:
         with:
           name: windows-tabnew-regressions
           path: cli/target/windows-tabnew-*.log
+          if-no-files-found: ignore
+
+  windows-full-lib-diagnostic:
+    name: Windows full library test diagnostic
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Run the unfiltered library suite with diagnostics
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          New-Item -ItemType Directory -Force -Path cli/target | Out-Null
+          cargo test --locked --profile ci --manifest-path cli/Cargo.toml --target x86_64-pc-windows-msvc --lib -- --nocapture 2>&1 | Tee-Object -FilePath cli/target/windows-full-lib-diagnostic.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path cli/target/windows-full-lib-diagnostic.log -Pattern '^running [1-9][0-9]* tests?$' -Quiet)) { throw "The unfiltered library test suite did not report a nonzero test count." }
+
+      - name: Preserve full library diagnostic output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-full-lib-diagnostic
+          path: cli/target/windows-full-lib-diagnostic.log
           if-no-files-found: ignore
 
   native-e2e:
