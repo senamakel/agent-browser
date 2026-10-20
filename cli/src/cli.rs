@@ -20,8 +20,6 @@ use std::ffi::c_void;
 #[cfg(windows)]
 use std::io;
 #[cfg(windows)]
-use std::marker::PhantomData;
-#[cfg(windows)]
 use std::mem::{size_of, size_of_val};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
