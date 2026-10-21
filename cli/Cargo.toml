@@ -53,6 +53,7 @@ windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_F
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.14"
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
