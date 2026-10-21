@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -29,10 +30,13 @@ impl TlsServer {
 
     fn with_response(cert: &str, key: &str, proxy: bool, body: &str) -> Self {
         let response = Arc::new(format!("HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
-        let certs = rustls_pemfile::certs(&mut cert.as_bytes())
+        let mut cert_reader = std::io::BufReader::new(cert.as_bytes());
+        let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut key.as_bytes())
+        let mut key_reader = std::io::BufReader::new(key.as_bytes());
+        let key = PrivateKeyDer::pem_reader_iter(&mut key_reader)
+            .next()
             .unwrap()
             .unwrap();
         let config = Arc::new(
