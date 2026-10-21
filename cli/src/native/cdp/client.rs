@@ -170,6 +170,7 @@ pub struct CdpClient {
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
     method_taps: MethodTaps,
+    stealth: AtomicBool,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -439,7 +440,23 @@ impl CdpClient {
             keepalive_handle: Mutex::new(Some(keepalive_handle)),
             private_sessions,
             method_taps,
+            stealth: AtomicBool::new(false),
         })
+    }
+
+    /// Stealth connections never write `Runtime.enable`. It is the call
+    /// detection scripts look for: it makes the browser serialise console
+    /// arguments, which a page can observe. Commands that need no Runtime
+    /// domain state, such as `Runtime.evaluate` and `Runtime.callFunctionOn`,
+    /// work without it.
+    pub fn set_stealth(&self, stealth: bool) {
+        self.stealth.store(stealth, Ordering::SeqCst);
+    }
+
+    /// True for `Runtime.enable` on a stealth connection, which is dropped
+    /// and reported as done.
+    fn withheld(&self, method: &str) -> bool {
+        method == "Runtime.enable" && self.stealth.load(Ordering::SeqCst)
     }
 
     fn ensure_open(&self) -> Result<(), String> {
@@ -486,6 +503,9 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        if self.withheld(method) {
+            return Ok(Value::Null);
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -634,6 +654,9 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
+        if self.withheld(method) {
+            return Ok(());
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let cmd = CdpCommand {
             id,
@@ -776,6 +799,80 @@ mod tests {
             None
         );
         assert_eq!(extract_command_id(r#"{"id":0,"result":{}}"#), None);
+    }
+
+    /// Serves one connection and returns every method it was sent, in order,
+    /// answering each with an empty result.
+    async fn record_methods(listener: TcpListener, count: usize) -> Vec<String> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut methods = Vec::new();
+        while methods.len() < count {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let command: Value = serde_json::from_str(&text).unwrap();
+            methods.push(command["method"].as_str().unwrap().to_string());
+            let id = command["id"].as_u64().unwrap();
+            ws.send(Message::Text(json!({"id": id, "result": {}}).to_string()))
+                .await
+                .unwrap();
+        }
+        methods
+    }
+
+    #[tokio::test]
+    async fn stealth_connection_never_writes_runtime_enable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(record_methods(listener, 2));
+
+        let client = CdpClient::connect(&url).await.unwrap();
+        client.set_stealth(true);
+        client
+            .send_command_no_params("Runtime.enable", Some("s1"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_wait("Runtime.enable", None, Some("s1"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Page.enable", Some("s1"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.await.unwrap(),
+            ["Page.enable", "Browser.getVersion"],
+            "Runtime.enable must not reach the wire"
+        );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn connection_without_stealth_writes_runtime_enable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(record_methods(listener, 2));
+
+        let client = CdpClient::connect(&url).await.unwrap();
+        client
+            .send_command_no_params("Runtime.enable", Some("s1"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.await.unwrap(),
+            ["Runtime.enable", "Browser.getVersion"]
+        );
+        client.close().await;
     }
 
     #[tokio::test]

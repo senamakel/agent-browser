@@ -272,14 +272,19 @@ agent-browser wait --fn "window.ready === true"  # Wait for JS condition
 # Use networkidle only when the page is known to become quiet
 agent-browser wait --load networkidle
 
+# Wait until the requests that change the page are done, ignoring pings, images, and other frames
+agent-browser wait --load networkquiet
+
 # Wait for text/element to disappear
 agent-browser wait --fn "!document.body.innerText.includes('Loading...')"
 agent-browser wait "#spinner" --state hidden
 ```
 
-**Load states:** `load`, `domcontentloaded`, `networkidle`
+**Load states:** `load`, `domcontentloaded`, `networkidle`, `networkquiet`
 
 After a page change, prefer a selector, text, URL, or JavaScript condition that represents the state you need. Use `load` or `domcontentloaded` when the lifecycle event is the milestone. `networkidle` is supported for pages known to become quiet, but SSE, WebSockets, polling, and long-polling can keep it from resolving.
+
+`networkquiet` resolves once the requests that can change what the page shows have been done for 500 ms: the page's own document, scripts, stylesheets, and XHR or fetch data. Analytics pings, images, fonts, media, prefetches, and other frames' documents are not counted, so a page that keeps sending them still goes quiet. Quiet is counted from the start of the wait, and requests an action sent in the 3 seconds before the wait are waited for too. A fetch that never ends, such as a long poll, can still keep it from resolving.
 
 ### Batch Execution
 
@@ -1740,6 +1745,33 @@ let reply = execute_command(
 `StateOptions` is the configuration a host builds directly, field by field, instead of `DaemonState::new()` reading it from the `AGENT_BROWSER_*` environment. That distinction matters for embedding: a process hosting multiple embedded sessions never has them reading and clobbering each other's configuration through shared environment variables. `DaemonState::new()` and `Default::default()` still read the environment, so the CLI's daemon is unaffected.
 
 `execute_command` takes the same JSON command shape the daemon reads from its socket and returns the same JSON response shape, documented under [Commands](#commands) above. There is no separate library API to learn beyond `StateOptions`, `DaemonState`, and `execute_command`; everything else about a command's request and response is exactly what the CLI already documents.
+
+### Identity launch fields
+
+The `launch` command takes fields that set what a page sees of the browser. They apply to the launch tab and to every tab the daemon opens afterwards, before its first navigation, and a change relaunches the browser. A value the browser rejects (such as an unknown timezone) fails the launch.
+
+<table>
+<thead>
+<tr><th>Field</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>userAgent</code></td><td>User agent string, as before.</td></tr>
+<tr><td><code>userAgentMetadata</code></td><td>Client hints for the user agent: <code>brands</code>, <code>fullVersionList</code>, <code>fullVersion</code>, <code>platform</code> (required), <code>platformVersion</code>, <code>architecture</code>, <code>model</code>, <code>mobile</code>, <code>bitness</code>, <code>wow64</code>. Sets <code>navigator.userAgentData</code> and the <code>sec-ch-ua*</code> request headers. Without it, Chrome sends no <code>sec-ch-ua</code> once the user agent is overridden.</td></tr>
+<tr><td><code>acceptLanguage</code></td><td>Languages for the <code>Accept-Language</code> header, comma-separated without q-values (<code>ja-JP,ja</code>); Chrome adds the q-values. The locale override does not change this header.</td></tr>
+<tr><td><code>timezone</code></td><td>IANA timezone ID, such as <code>Asia/Tokyo</code>.</td></tr>
+<tr><td><code>locale</code></td><td>Locale such as <code>ja-JP</code>, for <code>navigator.language</code> and <code>Intl</code>.</td></tr>
+<tr><td><code>screen</code></td><td><code>{ width, height, deviceScaleFactor }</code>: what <code>screen.width</code>, <code>screen.height</code> and <code>devicePixelRatio</code> report. The viewport keeps its size until a <code>viewport</code> command replaces the override.</td></tr>
+<tr><td><code>initScriptSources</code></td><td>Array of script sources run before the page's own scripts in every document, like <code>--init-script</code> but inline.</td></tr>
+</tbody>
+</table>
+
+The <code>useragent</code> command also accepts <code>userAgentMetadata</code> and <code>acceptLanguage</code>. These apply to browsers the engine launches; they are not sent to a browser it connects to over CDP.
+
+### Stealth
+
+Set `AGENT_BROWSER_STEALTH=1`, or `"stealth": true` in the `launch` command, and the engine never sends `Runtime.enable` to the browser it launches, on any tab or frame. That call is one of the signals bot checks look for in a browser driven over CDP. Everything else keeps working: `evaluate`, snapshots, clicks, typing and reading run through `Runtime.evaluate` and `Runtime.callFunctionOn`, which need no `Runtime.enable`.
+
+What stealth turns off: the `console` and `errors` commands and console streaming, since Chrome only reports console messages and page exceptions to a client that enabled the Runtime domain. It is off by default and changing it relaunches the browser. It does not apply to a browser the engine connects to over CDP.
 
 The CLI and MCP surfaces are unchanged by this. The library exposes the daemon's existing command dispatcher; it does not add commands or change existing behavior.
 

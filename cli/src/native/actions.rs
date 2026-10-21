@@ -15,7 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
 use super::auth;
-use super::browser::{should_track_target, BrowserManager, WaitUntil};
+use super::browser::{should_track_target, wall_now, BrowserManager, InFlight, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -26,6 +26,7 @@ use super::cdp::types::{
 use super::cookies;
 use super::diff;
 use super::element::RefMap;
+use super::identity::{Emulation, Identity, Screen, UserAgentMetadata};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -318,6 +319,7 @@ fn launch_hash(
     opts.proxy_username.hash(&mut h);
     opts.proxy_password.hash(&mut h);
     opts.user_agent.hash(&mut h);
+    opts.identity.fingerprint().hash(&mut h);
     opts.ca_cert_digest.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
@@ -325,6 +327,7 @@ fn launch_hash(
     opts.webmcp.hash(&mut h);
     opts.no_xvfb.hash(&mut h);
     opts.restrict_webrtc.hash(&mut h);
+    opts.stealth.hash(&mut h);
     allowed_domains.hash(&mut h);
     enable_features.hash(&mut h);
     init_script_paths.hash(&mut h);
@@ -559,6 +562,12 @@ pub struct SessionSetup {
     pub emulated_media: Option<EmulatedMedia>,
     pub timezone: Option<String>,
     pub locale: Option<String>,
+    /// Client-hint metadata sent with the user agent override.
+    pub user_agent_metadata: Option<UserAgentMetadata>,
+    /// `Accept-Language` sent with the user agent override.
+    pub accept_language: Option<String>,
+    /// Screen size and pixel ratio from the `launch` command.
+    pub screen: Option<Screen>,
     /// `(latitude, longitude, accuracy)`.
     pub geolocation: Option<(f64, f64, Option<f64>)>,
     /// Global headers from the `headers` and `credentials` commands
@@ -579,6 +588,11 @@ impl SessionSetup {
     fn from_launch_options(options: &LaunchOptions) -> Self {
         Self {
             user_agent: options.user_agent.clone(),
+            timezone: options.identity.timezone.clone(),
+            locale: options.identity.locale.clone(),
+            user_agent_metadata: options.identity.user_agent_metadata.clone(),
+            accept_language: options.identity.accept_language.clone(),
+            screen: options.identity.screen.clone(),
             emulated_media: options.color_scheme.as_ref().map(|scheme| EmulatedMedia {
                 media: None,
                 features: vec![("prefers-color-scheme".to_string(), scheme.clone())],
@@ -590,6 +604,9 @@ impl SessionSetup {
     /// True when nothing has been configured, so there is nothing to replay.
     fn is_empty(&self) -> bool {
         self.user_agent.is_none()
+            && self.user_agent_metadata.is_none()
+            && self.accept_language.is_none()
+            && self.screen.is_none()
             && self.emulated_media.is_none()
             && self.timezone.is_none()
             && self.locale.is_none()
@@ -681,6 +698,9 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
+    /// The active page's page-changing requests not yet finished, for a
+    /// `networkquiet` wait that starts after the action that sent them.
+    pub(crate) in_flight: InFlight,
     pub active_frame_id: Option<String>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
@@ -937,6 +957,7 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
+            in_flight: InFlight::default(),
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
@@ -1984,6 +2005,20 @@ impl DaemonState {
                     } else {
                         false
                     };
+
+                    if let (true, Some(browser), Some(session_id)) = (
+                        session_matches,
+                        self.browser.as_ref(),
+                        event.session_id.as_deref(),
+                    ) {
+                        self.in_flight.note(
+                            session_id,
+                            &event.method,
+                            &event.params,
+                            browser.page_target_id(session_id),
+                            wall_now(),
+                        );
+                    }
 
                     // Allow Network events from cross-origin iframe sessions
                     // when HAR recording or request tracking is active.
@@ -4135,8 +4170,10 @@ async fn session_setup_pending(state: &DaemonState) -> bool {
 ///
 /// Call after `Page`/`Network` are enabled on `session_id` and before its
 /// first navigation, so init scripts, UA, and headers cover the initial
-/// document. Emulation failures are ignored: a call the engine rejects
-/// should not abort creating the tab.
+/// document. Identity (user agent, client hints, language, timezone, locale,
+/// screen) is not best-effort: a target that missed it would leak the
+/// browser's own, so a rejected call fails creating the tab. Geolocation and
+/// media emulation failures are ignored.
 async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Result<(), String> {
     let client = state
         .browser
@@ -4146,15 +4183,16 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         .clone();
     let setup = state.session_setup.clone();
 
-    if let Some(ref ua) = setup.user_agent {
-        let _ = client
-            .send_command(
-                "Emulation.setUserAgentOverride",
-                Some(json!({ "userAgent": ua })),
-                Some(session_id),
-            )
-            .await;
+    Emulation {
+        user_agent: setup.user_agent.as_deref(),
+        user_agent_metadata: setup.user_agent_metadata.as_ref(),
+        accept_language: setup.accept_language.as_deref(),
+        timezone: setup.timezone.as_deref(),
+        locale: setup.locale.as_deref(),
+        screen: setup.screen.as_ref(),
     }
+    .apply(&client, session_id)
+    .await?;
 
     if let Some(ref emulated) = setup.emulated_media {
         let mut params = json!({});
@@ -4172,26 +4210,6 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         }
         let _ = client
             .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
-            .await;
-    }
-
-    if let Some(ref tz) = setup.timezone {
-        let _ = client
-            .send_command(
-                "Emulation.setTimezoneOverride",
-                Some(json!({ "timezoneId": tz })),
-                Some(session_id),
-            )
-            .await;
-    }
-
-    if let Some(ref locale) = setup.locale {
-        let _ = client
-            .send_command(
-                "Emulation.setLocaleOverride",
-                Some(json!({ "locale": locale })),
-                Some(session_id),
-            )
             .await;
     }
 
@@ -4675,6 +4693,7 @@ async fn apply_launch_mutator_plugins(
             "allowFileAccess": options.allow_file_access,
             "webgpu": options.webgpu,
             "noXvfb": options.no_xvfb,
+            "stealth": options.stealth,
         }
     });
 
@@ -4742,6 +4761,8 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
+        stealth: stealth_from_env(),
+        identity: Identity::default(),
     }
 }
 
@@ -4779,6 +4800,18 @@ fn no_xvfb_from_env() -> bool {
     env::var("AGENT_BROWSER_NO_XVFB")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
+}
+
+fn stealth_from_env() -> bool {
+    env::var("AGENT_BROWSER_STEALTH")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
+fn stealth_from_launch_cmd(cmd: &Value) -> bool {
+    cmd.get("stealth")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(stealth_from_env)
 }
 
 fn no_xvfb_from_launch_cmd(cmd: &Value) -> bool {
@@ -5193,6 +5226,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         storage_state,
     })?;
 
+    let identity = Identity::from_launch_command(cmd)?;
     let mut launch_options = LaunchOptions {
         headless,
         executable_path: cmd
@@ -5267,6 +5301,8 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             }),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
+        stealth: stealth_from_launch_cmd(cmd),
+        identity,
     };
     if engine.as_deref() == Some("obscura") {
         if let Some(bypass) = cmd.get("proxyBypass") {
@@ -5286,6 +5322,11 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
         validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
+    }
+    // Inline sources from the launch command run like plugin scripts: on the
+    // launch target and every target the daemon creates after it.
+    if let Some(sources) = string_array_from_command(cmd, "initScriptSources") {
+        state.plugin_init_scripts.extend(sources);
     }
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -6922,8 +6963,7 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     if let Some(load_state) = cmd.get("loadState").and_then(|v| v.as_str()) {
         let wait_until = WaitUntil::from_str(load_state);
-        mgr.wait_for_lifecycle_external(wait_until, &session_id)
-            .await?;
+        wait_for_load_state(state, wait_until, &session_id).await?;
         return Ok(json!({ "waited": "load", "state": load_state }));
     }
 
@@ -7946,7 +7986,14 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .unwrap_or(1.0);
     let mobile = cmd.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    mgr.set_viewport(width, height, scale, mobile).await?;
+    mgr.set_viewport(
+        width,
+        height,
+        scale,
+        mobile,
+        state.session_setup.screen.as_ref(),
+    )
+    .await?;
 
     state.viewport = Some((width, height, scale, mobile));
 
@@ -7964,8 +8011,18 @@ async fn handle_user_agent(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .get("userAgent")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'userAgent' parameter")?;
-    mgr.set_user_agent(ua).await?;
+    // Optional client-hint metadata and Accept-Language. Left out, they are
+    // cleared, as a user agent set without them never carried them.
+    let identity = Identity::from_launch_command(cmd)?;
+    mgr.set_user_agent(
+        ua,
+        identity.user_agent_metadata.as_ref(),
+        identity.accept_language.as_deref(),
+    )
+    .await?;
     state.session_setup.user_agent = Some(ua.to_string());
+    state.session_setup.user_agent_metadata = identity.user_agent_metadata;
+    state.session_setup.accept_language = identity.accept_language;
     Ok(json!({ "userAgent": ua }))
 }
 
@@ -9410,11 +9467,13 @@ async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         _ => return Err(format!("Unknown device: {}. Supported: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25", name)),
     };
 
-    mgr.set_viewport(width, height, scale, mobile).await?;
-    mgr.set_user_agent(ua).await?;
+    mgr.set_viewport(width, height, scale, mobile, None).await?;
+    mgr.set_user_agent(ua, None, None).await?;
 
     state.viewport = Some((width, height, scale, mobile));
     state.session_setup.user_agent = Some(ua.to_string());
+    state.session_setup.user_agent_metadata = None;
+    state.session_setup.accept_language = None;
 
     // Update stream server viewport so status messages and screencast use the new dimensions
     if let Some(ref server) = state.stream_server {
@@ -10002,7 +10061,7 @@ async fn handle_waitforurl(cmd: &Value, state: &DaemonState) -> Result<Value, St
     Ok(json!({ "url": url }))
 }
 
-async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_waitforloadstate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let load_state = cmd.get("state").and_then(|v| v.as_str()).unwrap_or("load");
@@ -10011,12 +10070,40 @@ async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Val
     let wait_until = WaitUntil::from_str(load_state);
     let _ = tokio::time::timeout(
         tokio::time::Duration::from_millis(timeout_ms),
-        mgr.wait_for_lifecycle_external(wait_until, &session_id),
+        wait_for_load_state(state, wait_until, &session_id),
     )
     .await
     .map_err(|_| format!("Timeout waiting for load state: {}", load_state))?;
 
     Ok(json!({ "state": load_state }))
+}
+
+/// Waits for `wait_until` on `session_id`. The action a `networkquiet` wait
+/// follows sent its requests before the wait could subscribe, so it
+/// subscribes, then drains what came before: every request is then either
+/// kept in flight ([`InFlight`]) or seen by the wait.
+async fn wait_for_load_state(
+    state: &mut DaemonState,
+    wait_until: WaitUntil,
+    session_id: &str,
+) -> Result<(), String> {
+    if wait_until != WaitUntil::NetworkQuiet {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        return mgr
+            .wait_for_lifecycle_external(wait_until, session_id)
+            .await;
+    }
+    let mut rx = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .client
+        .subscribe();
+    state.drain_cdp_events_background().await?;
+    let in_flight = state.in_flight.recent(session_id, wall_now());
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    mgr.wait_for_network_quiet(session_id, &mut rx, in_flight)
+        .await
 }
 
 async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -11396,7 +11483,14 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .and_then(|v| v.as_i64())
             .unwrap_or(720) as i32;
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.set_viewport(width, height, 1.0, false).await?;
+        mgr.set_viewport(
+            width,
+            height,
+            1.0,
+            false,
+            state.session_setup.screen.as_ref(),
+        )
+        .await?;
 
         // Update stream server viewport
         if let Some(ref server) = state.stream_server {
@@ -16896,6 +16990,33 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
+    fn test_stealth_from_launch_cmd() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_STEALTH"]);
+        guard.remove("AGENT_BROWSER_STEALTH");
+        assert!(stealth_from_launch_cmd(&json!({ "stealth": true })));
+        assert!(!stealth_from_launch_cmd(&json!({ "stealth": false })));
+        // Falls back to the daemon env when the command omits the field.
+        assert!(!stealth_from_launch_cmd(&json!({})));
+        guard.set("AGENT_BROWSER_STEALTH", "1");
+        assert!(stealth_from_launch_cmd(&json!({})));
+        assert!(!stealth_from_launch_cmd(&json!({ "stealth": false })));
+        assert!(launch_options_from_env().stealth);
+    }
+
+    #[test]
+    fn test_launch_hash_includes_stealth() {
+        let base = LaunchOptions::default();
+        let stealth = LaunchOptions {
+            stealth: true,
+            ..Default::default()
+        };
+        assert_ne!(
+            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&stealth, &[], &[], &[], &[], Some("chrome"), "local", None)
+        );
+    }
+
+    #[test]
     fn test_launch_hash_includes_no_xvfb() {
         let base = LaunchOptions::default();
         let no_xvfb = LaunchOptions {
@@ -17762,6 +17883,72 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 None
             )
         );
+    }
+
+    #[test]
+    fn test_launch_hash_changes_with_identity_options() {
+        let base = LaunchOptions::default();
+        let hash = |opts: &LaunchOptions| {
+            launch_hash(opts, &[], &[], &[], &[], Some("chrome"), "local", None)
+        };
+        for identity in [
+            Identity {
+                timezone: Some("Asia/Tokyo".into()),
+                ..Identity::default()
+            },
+            Identity {
+                locale: Some("ja-JP".into()),
+                ..Identity::default()
+            },
+            Identity {
+                accept_language: Some("ja-JP".into()),
+                ..Identity::default()
+            },
+            Identity {
+                screen: Some(Screen {
+                    width: 1920,
+                    height: 1080,
+                    device_scale_factor: 2.0,
+                }),
+                ..Identity::default()
+            },
+        ] {
+            let changed = LaunchOptions {
+                identity,
+                ..base.clone()
+            };
+            assert_ne!(hash(&base), hash(&changed));
+        }
+    }
+
+    #[test]
+    fn test_session_setup_from_launch_options_carries_identity() {
+        let options = LaunchOptions {
+            user_agent: Some("UA/1".into()),
+            identity: Identity {
+                timezone: Some("Asia/Tokyo".into()),
+                locale: Some("ja-JP".into()),
+                accept_language: Some("ja-JP,ja".into()),
+                screen: Some(Screen {
+                    width: 1920,
+                    height: 1080,
+                    device_scale_factor: 2.0,
+                }),
+                ..Identity::default()
+            },
+            ..LaunchOptions::default()
+        };
+        let setup = SessionSetup::from_launch_options(&options);
+        assert_eq!(setup.timezone.as_deref(), Some("Asia/Tokyo"));
+        assert_eq!(setup.locale.as_deref(), Some("ja-JP"));
+        assert_eq!(setup.accept_language.as_deref(), Some("ja-JP,ja"));
+        assert_eq!(setup.screen.as_ref().map(|s| s.width), Some(1920));
+        assert!(!setup.is_empty());
+        let language_only = SessionSetup {
+            accept_language: Some("de".into()),
+            ..SessionSetup::default()
+        };
+        assert!(!language_only.is_empty());
     }
 
     #[test]

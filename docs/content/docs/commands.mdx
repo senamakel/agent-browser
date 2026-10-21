@@ -137,13 +137,14 @@ agent-browser wait --url "**/dash"    # Wait for URL pattern
 agent-browser wait --load domcontentloaded # Wait for DOMContentLoaded
 agent-browser wait --load load        # Wait for the load event
 agent-browser wait --load networkidle # Use only for pages known to become quiet
+agent-browser wait --load networkquiet # Wait for the requests that change the page
 agent-browser wait --fn "condition"   # Wait for JS condition
 agent-browser wait --download [path]  # Wait for download
 agent-browser wait --fn "!document.body.innerText.includes('Loading...')"  # Wait for text to disappear
 agent-browser wait "#spinner" --state hidden           # Wait for element to disappear
 ```
 
-After a page change, prefer a selector, text, URL, or JavaScript condition that represents the state you need. Use `networkidle` only when the page is known to become quiet, because SSE, WebSockets, polling, and long-polling can keep it from resolving.
+After a page change, prefer a selector, text, URL, or JavaScript condition that represents the state you need. Use `networkidle` only when the page is known to become quiet, because SSE, WebSockets, polling, and long-polling can keep it from resolving. `networkquiet` counts only the requests that can change what the page shows (the page's document, scripts, stylesheets, XHR and fetch), so analytics pings, images, and other frames' documents do not hold it up.
 
 ## Downloads
 

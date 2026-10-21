@@ -2134,7 +2134,7 @@ Modes:
   <selector>           Wait for element to appear
   <ms>                 Wait for specified milliseconds
   --url <pattern>      Wait for URL to match pattern
-  --load <state>       Wait for load state (load, domcontentloaded, networkidle)
+  --load <state>       Wait for load state (load, domcontentloaded, networkidle, networkquiet)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
   --download [path]    Wait for a download to complete (optionally save to path)
@@ -2158,6 +2158,8 @@ Examples:
   agent-browser wait --url "**/dashboard"
   # Use networkidle only for pages known to become quiet:
   agent-browser wait --load networkidle
+  # Wait for the requests that change the page (not pings or images):
+  agent-browser wait --load networkquiet
   agent-browser wait --fn "window.appReady === true"
   agent-browser wait --text "Welcome back"
   agent-browser wait --download ./file.pdf
@@ -3483,7 +3485,7 @@ URL Diff:
   Options:
     --screenshot             Also compare screenshots (default: snapshot only)
     --full                   Full page screenshots
-    --wait-until <strategy>  Navigation wait strategy: load, domcontentloaded, networkidle (default: load)
+    --wait-until <strategy>  Navigation wait strategy: load, domcontentloaded, networkidle, networkquiet (default: load)
     -s, --selector <sel>     Scope snapshots to a CSS selector or @ref
     -c, --compact            Use compact snapshot format
     -d, --depth <n>          Limit snapshot tree depth
@@ -4146,6 +4148,7 @@ Environment:
   AGENT_BROWSER_ENABLE           Comma-separated built-in init script features (e.g. react-devtools)
   AGENT_BROWSER_HEADED           Show browser window (not headless)
   AGENT_BROWSER_NO_XVFB          Disable automatic Xvfb for headed mode on displayless Linux hosts
+  AGENT_BROWSER_STEALTH          Never send Runtime.enable (no console or page-error capture)
   AGENT_BROWSER_WEBGPU           Enable WebGPU (SwiftShader software Vulkan on Linux)
   AGENT_BROWSER_JSON             JSON output
   AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend

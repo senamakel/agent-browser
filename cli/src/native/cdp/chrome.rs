@@ -374,6 +374,13 @@ pub struct LaunchOptions {
     /// Restrict WebRTC to proxied transports so direct UDP cannot bypass the
     /// HTTP domain filter. Enabled automatically with `--allowed-domains`.
     pub restrict_webrtc: bool,
+    /// Never send `Runtime.enable` (AGENT_BROWSER_STEALTH). It is the call
+    /// bot checks look for. Console and page-error capture need it, so they
+    /// are off for a stealth session.
+    pub stealth: bool,
+    /// Client-hint metadata, `Accept-Language`, timezone, locale and screen,
+    /// applied to every target before its first navigation.
+    pub identity: crate::native::identity::Identity,
 }
 
 impl LaunchOptions {
@@ -415,6 +422,8 @@ impl Default for LaunchOptions {
             webmcp: true,
             no_xvfb: false,
             restrict_webrtc: false,
+            stealth: false,
+            identity: crate::native::identity::Identity::default(),
         }
     }
 }

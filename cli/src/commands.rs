@@ -2807,7 +2807,7 @@ fn parse_diff(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                         } else {
                             return Err(ParseError::MissingArguments {
                                 context: "diff url --wait-until".to_string(),
-                                usage: "diff url <url1> <url2> --wait-until <load|domcontentloaded|networkidle>",
+                                usage: "diff url <url1> <url2> --wait-until <load|domcontentloaded|networkidle|networkquiet>",
                             });
                         }
                     }
@@ -3605,6 +3605,7 @@ mod tests {
             webgpu: false,
             no_webmcp: false,
             no_xvfb: false,
+            stealth: false,
             device: None,
             auto_connect: false,
             pin_tab: false,
