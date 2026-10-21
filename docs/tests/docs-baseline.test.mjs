@@ -106,6 +106,21 @@ test("commands baseline allows the clarified comma behavior for --args", () => {
   assert.ok(commands.legacyMarkdown.includes(line));
 });
 
+test("CDP and configuration baselines allow the clarified comma behavior for launch args", () => {
+  const cdp = currentPages.find((page) => page.path === "/cdp-mode");
+  const configuration = currentPages.find(
+    (page) => page.path === "/configuration",
+  );
+  const cdpDescription =
+    "Browser launch args. Commas inside a value are kept.";
+  const configurationDescription =
+    "Browser launch arguments, separated by newlines or by commas before another flag. Commas inside a value are kept.";
+  assert.ok(cdp.modernMarkdown.includes(cdpDescription));
+  assert.ok(cdp.legacyMarkdown.includes(cdpDescription));
+  assert.ok(configuration.modernMarkdown.includes(configurationDescription));
+  assert.ok(configuration.legacyMarkdown.includes(configurationDescription));
+});
+
 test("WebMCP appears once in Features after CDP Mode in both navigation sources", async () => {
   const meta = JSON.parse(
     await readFile(

@@ -20,8 +20,18 @@
     ],
     "/configuration": [
       {
+        "from": "Comma or newline separated browser launch arguments.",
+        "to": "Browser launch arguments, separated by newlines or by commas before another flag. Commas inside a value are kept."
+      },
+      {
         "from": "This initial implementation does not support",
         "to": "Browser trust does not support"
+      }
+    ],
+    "/cdp-mode": [
+      {
+        "from": "Browser launch args (comma-separated)",
+        "to": "Browser launch args. Commas inside a value are kept."
       }
     ],
     "/proxy": [
