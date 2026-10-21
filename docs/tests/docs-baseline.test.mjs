@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import { test } from "node:test";
 import { navigation } from "../src/lib/docs-navigation.ts";
 import {
@@ -89,6 +89,14 @@ test("baseline pins all 39 routes and the original metadata, slugger and convert
     );
     assert.ok(page.content.length > 0, page.path);
   }
+});
+
+test("stored docs baseline fixture stays below the repository file-size limit", async () => {
+  const fixture = new URL("./fixtures/docs-baseline.json.gz", import.meta.url);
+  assert.ok(
+    (await stat(fixture)).size < 1_000_000,
+    "The checked-in docs baseline fixture must stay below 1 MB",
+  );
 });
 
 test("WebMCP appears once in Features after CDP Mode in both navigation sources", async () => {
