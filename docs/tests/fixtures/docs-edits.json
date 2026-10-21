@@ -2,6 +2,10 @@
   "pages": {
     "/commands": [
       {
+        "from": "agent-browser wait --load networkidle # Use only for pages known to become quiet",
+        "to": "agent-browser wait --load networkidle # Use only for pages known to become quiet\nagent-browser wait --load networkquiet # Wait for the requests that change the page"
+      },
+      {
         "from": "# Trust a CA for locally launched Chromium on Linux",
         "to": "# Trust a CA for CLI requests, and for local Chromium on Linux"
       },
