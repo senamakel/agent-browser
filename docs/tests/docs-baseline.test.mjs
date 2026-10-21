@@ -99,6 +99,13 @@ test("stored docs baseline fixture stays below the repository file-size limit", 
   );
 });
 
+test("commands baseline allows the clarified comma behavior for --args", () => {
+  const commands = currentPages.find((page) => page.path === "/commands");
+  const line = "--args <args>            # Browser launch args (commas inside a value are kept)";
+  assert.ok(commands.modernMarkdown.includes(line));
+  assert.ok(commands.legacyMarkdown.includes(line));
+});
+
 test("WebMCP appears once in Features after CDP Mode in both navigation sources", async () => {
   const meta = JSON.parse(
     await readFile(

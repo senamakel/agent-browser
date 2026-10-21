@@ -2,6 +2,10 @@
   "pages": {
     "/commands": [
       {
+        "from": "--args <args>            # Browser launch args (comma separated)",
+        "to": "--args <args>            # Browser launch args (commas inside a value are kept)"
+      },
+      {
         "from": "agent-browser wait --load networkidle # Use only for pages known to become quiet",
         "to": "agent-browser wait --load networkidle # Use only for pages known to become quiet\nagent-browser wait --load networkquiet # Wait for the requests that change the page"
       },
