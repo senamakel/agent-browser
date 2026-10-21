@@ -1,5 +1,17 @@
 # agent-browser
 
+## 0.38.3
+
+<!-- release:start -->
+### Security
+
+- Updated the WebSocket dependency to the published Tokio Tungstenite 0.24.1 source revision while retaining the existing Rustls web-PKI root configuration.
+
+### Contributors
+
+- @senamakel
+<!-- release:end -->
+
 ## 0.38.2
 
 ### Security
@@ -9,7 +21,6 @@
 
 ## 0.38.1
 
-<!-- release:start -->
 ### Bug Fixes
 
 - Fixed **recording cursor and mouse movement timing** so cursor rendering stays synchronized with page content during drags and timed mouse moves (#1869)
@@ -22,7 +33,6 @@
 
 - @ctate
 - @Railly
-<!-- release:end -->
 
 ## 0.38.0
 
