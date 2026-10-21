@@ -94,9 +94,6 @@ jobs:
         with:
           workspaces: cli
 
-      - name: Install Rust integration test dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libnss3-tools
-
       - name: Format check
         run: cargo fmt --manifest-path cli/Cargo.toml -- --check
 
